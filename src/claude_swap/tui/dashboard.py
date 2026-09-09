@@ -16,6 +16,9 @@ Wherever a cursor exists, ``-``/``+`` move the selected account one place up
 or down the list — the accounts trade slot numbers, so their numeric
 shortcuts move with them.
 
+Mouse: a single click on an account only moves the cursor to it; a *double*
+click switches to that account. Nothing account-changing hangs off one click.
+
 No global command palette: actions live where their context is.
 """
 
@@ -384,6 +387,11 @@ class SwitchScreen(AccountListScreen):
             self.app.do_switch(item.number)
             self.app.pop_screen()
 
+    def on_account_item_activated(self, event: AccountItem.Activated) -> None:
+        """Double click — same outcome as Enter on that row."""
+        self.app.do_switch(event.item.number)
+        self.app.pop_screen()
+
     def action_select_highlighted(self) -> None:
         listview = self.query_one("#accounts", ListView)
         if listview.display:
@@ -400,6 +408,10 @@ class WatchScreen(AccountListScreen):
     switches and stays here — you keep watching on the new account, and
     ``-``/``+`` reorder the selected account without leaving either. Esc
     disarms selection first, then leaves the screen.
+
+    A double click switches without arming anything: it is a deliberate
+    gesture in a way Enter is not, which is the whole reason Enter is gated.
+    Either way the screen returns to hands-off monitoring afterwards.
     """
 
     _WATCH_TITLE = "watching all accounts"
@@ -468,11 +480,21 @@ class WatchScreen(AccountListScreen):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if not self._selecting:
-            return  # e.g. a stray click while just watching
+            return  # Enter is inert until selection is armed
         item = event.item
         if isinstance(item, AccountItem):
             self.app.do_switch(item.number)
             self._set_selecting(False)  # stay here, keep watching
+
+    def on_account_item_activated(self, event: AccountItem.Activated) -> None:
+        """Double click switches whether or not selection is armed.
+
+        Then back to hands-off: ``_set_selecting(False)`` also clears the
+        highlight the click itself put there, so the monitor is left as it
+        was found.
+        """
+        self.app.do_switch(event.item.number)
+        self._set_selecting(False)
 
     def action_select_highlighted(self) -> None:
         if self._selecting:

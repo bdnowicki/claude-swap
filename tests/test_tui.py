@@ -1552,6 +1552,123 @@ class TestReorder:
             assert not any(c[0] == "swap" for c in fake.calls)
 
 
+def ListView_():
+    from textual.widgets import ListView
+
+    return ListView
+
+
+@pytest.mark.asyncio
+class TestClickToActivate:
+    """A single click only moves the cursor; a double click switches.
+
+    Nothing account-changing hangs off one click — base `ListItem` turns
+    every click into `ListView.Selected`, which is also what Enter posts.
+    """
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+
+    def _items(self, app):
+        from claude_swap.tui.widgets import AccountItem
+
+        return list(app.screen.query(AccountItem))
+
+    async def test_single_click_moves_the_cursor_without_switching(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.click(self._items(app)[2])
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            from claude_swap.tui.dashboard import SwitchScreen
+
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+            assert isinstance(app.screen, SwitchScreen)  # did not pop either
+            assert app.screen.query_one("#accounts", ListView).index == 2
+
+    async def test_double_click_switches_and_pops(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.double_click(self._items(app)[1])
+            await settle(pilot)
+            from claude_swap.tui.dashboard import DashboardScreen
+
+            assert ("switch_to", "2") in fake.calls
+            assert isinstance(app.screen, DashboardScreen)
+            assert app.snapshot.active_number == "2"
+
+    async def test_double_click_switches_exactly_once(self, tmp_path):
+        """The item posts its own message instead of letting `ListView` also
+        raise `Selected`, or both handlers would fire on one gesture."""
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.double_click(self._items(app)[1])
+            await settle(pilot)
+            assert [c for c in fake.calls if c[0] == "switch_to"] == [
+                ("switch_to", "2")
+            ]
+
+    async def test_watch_double_click_switches_without_arming(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            assert app.screen.query_one("#accounts", ListView_()).index is None
+            await pilot.double_click(self._items(app)[1])
+            await settle(pilot)
+            from claude_swap.tui.dashboard import WatchScreen
+
+            assert ("switch_to", "2") in fake.calls
+            assert isinstance(app.screen, WatchScreen)  # stayed watching
+            # Back to hands-off: the highlight the click made is cleared.
+            assert app.screen.query_one("#accounts", ListView_()).index is None
+
+    async def test_watch_single_click_never_switches(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.click(self._items(app)[1])
+            await settle(pilot)
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+
+    async def test_watch_armed_double_click_switches_and_disarms(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")  # arm selection
+            await pilot.pause()
+            await pilot.double_click(self._items(app)[2])
+            await settle(pilot)
+            assert [c for c in fake.calls if c[0] == "switch_to"] == [
+                ("switch_to", "3")
+            ]
+            assert app.screen.query_one("#accounts", ListView_()).index is None
+
+
 def fake_calls(app) -> list[tuple]:
     return app.switcher.calls
 

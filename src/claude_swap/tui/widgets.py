@@ -12,7 +12,9 @@ import time
 from typing import TYPE_CHECKING
 
 from rich.text import Text
-from textual.widgets import ListItem, Static
+from textual import events
+from textual.message import Message
+from textual.widgets import ListItem, ListView, Static
 
 from claude_swap import pace
 from claude_swap.json_output import USAGE_API_KEY
@@ -381,10 +383,50 @@ class AccountCard(Static):
 class AccountItem(ListItem):
     """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
 
+    class Activated(Message):
+        """A double click on this row — switch to the account it shows.
+
+        Deliberately *not* ``ListView.Selected``: that message is what Enter
+        posts, and the watch screen keeps Enter inert until ``s`` arms
+        selection. A separate message means neither screen has to guess which
+        input a select came from.
+        """
+
+        def __init__(self, item: "AccountItem") -> None:
+            self.item = item
+            super().__init__()
+
     def __init__(self, acc: AccountSnapshot) -> None:
         super().__init__(AccountCard(acc))
         self.number = acc.number
         self.email = acc.email
+
+    def _on_click(self, event: events.Click) -> None:
+        """Single click moves the cursor here; a double click activates.
+
+        Base ``ListItem`` posts ``_ChildClicked`` for *every* click, which
+        ``ListView`` turns into ``Selected`` — the message Enter also sends —
+        so a single stray click used to switch accounts.
+
+        ``prevent_default()`` is what suppresses that, and it is load-bearing:
+        Textual dispatches an event to the handler in *every* class of the
+        MRO, so simply defining this method does not replace
+        ``ListItem._on_click`` — both would run (that is also why no
+        ``super()`` call belongs here). Only ``prevent_default`` stops the
+        walk before the base class.
+
+        What is left is what ``ListView`` would have done minus the select
+        (focus, move the highlight), plus :class:`Activated` on the second
+        click of a chain. A click therefore never produces ``Selected``, so
+        the screens' Enter gating needs no notion of where a select came from.
+        """
+        event.prevent_default()
+        listview = self.parent
+        if isinstance(listview, ListView):
+            listview.focus()
+            listview.index = list(listview.children).index(self)
+        if event.chain >= 2:
+            self.post_message(self.Activated(self))
 
     def set_account(self, acc: AccountSnapshot) -> None:
         self.number = acc.number
