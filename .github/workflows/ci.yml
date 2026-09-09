@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets a run be started by hand (`gh workflow run ci.yml`), which the push
+  # and pull_request triggers cannot do — useful after a change to the
+  # environment rather than to the code.
+  workflow_dispatch:
 
 jobs:
   test:
