@@ -168,6 +168,8 @@ Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usag
 
 In the account lists (`s` to switch, or `s` again on the watch page to pick an account), `-` and `+` move the selected account one place up or down. It trades slot numbers with its neighbour, so the account's numeric shortcut moves with it — the same thing `cswap move` does from the shell.
 
+With the mouse, a single click on an account only moves the cursor to it; a **double** click switches to that account. Nothing account-changing hangs off a single click, so a stray one is harmless.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
