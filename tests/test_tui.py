@@ -1351,17 +1351,23 @@ class TestReorder:
             tmp_path,
         )
 
-    async def _switch_screen(self, pilot):
-        """Open the switch list; the cursor starts on the active account (1)."""
+    async def _ordering(self, pilot):
+        """Open the switch list and arm reorder mode with `o`.
+
+        The cursor starts on the active account (1). `-`/`+` do nothing until
+        `o` arms them, so every test below has to go through it.
+        """
         await settle(pilot)
         await pilot.press("s")
+        await pilot.pause()
+        await pilot.press("o")
         await pilot.pause()
 
     async def test_plus_moves_selected_account_down_cursor_follows(self, tmp_path):
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             await pilot.press("plus")
             await settle(pilot)
             from textual.widgets import ListView
@@ -1380,7 +1386,7 @@ class TestReorder:
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             await pilot.press("down", "down")  # cursor on account 3
             await pilot.pause()
             await pilot.press("minus")
@@ -1402,7 +1408,7 @@ class TestReorder:
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             await pilot.press("plus")
             await settle(pilot)
             await pilot.press("plus")
@@ -1421,7 +1427,7 @@ class TestReorder:
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             await pilot.press("minus")  # already first
             await settle(pilot)
             await pilot.press("down", "down")
@@ -1437,7 +1443,7 @@ class TestReorder:
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             app.busy = True  # another action still in flight
             await pilot.press("plus")
             await pilot.pause()
@@ -1446,7 +1452,7 @@ class TestReorder:
             assert not any(c[0] == "swap" for c in fake.calls)
             assert app.screen.query_one("#accounts", ListView).index == 0
 
-    async def test_watch_screen_reorders_only_once_armed(self, tmp_path):
+    async def test_watch_screen_reorders_only_once_o_armed(self, tmp_path):
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
@@ -1456,7 +1462,7 @@ class TestReorder:
             await pilot.press("plus")  # inert while just watching
             await settle(pilot)
             assert not any(c[0] == "swap" for c in fake.calls)
-            await pilot.press("s")  # arm selection
+            await pilot.press("o")  # arm reorder
             await pilot.pause()
             await pilot.press("plus")
             await settle(pilot)
@@ -1472,7 +1478,7 @@ class TestReorder:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             screen = app.screen
             await pilot.press("plus")
             await settle(pilot)
@@ -1495,7 +1501,7 @@ class TestReorder:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             screen = app.screen
             await pilot.press("plus")
             await settle_after_worker_error(pilot)
@@ -1512,7 +1518,7 @@ class TestReorder:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             screen = app.screen
             await pilot.press("plus")  # cursor moves 0 -> 1 with the account
             await wait_event(fake.swap_started)
@@ -1531,7 +1537,7 @@ class TestReorder:
         )
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             await pilot.press("plus")
             await wait_event(fake.swap_started)
             await pilot.press("escape")  # pops the list out from under the callback
@@ -1546,10 +1552,120 @@ class TestReorder:
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(100, 40)) as pilot:
-            await self._switch_screen(pilot)
+            await self._ordering(pilot)
             await pilot.press("plus", "minus")
             await settle(pilot)
             assert not any(c[0] == "swap" for c in fake.calls)
+
+
+@pytest.mark.asyncio
+class TestOrderMode:
+    """`o` arms reordering; it and the switch gesture are never both live."""
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+
+    async def test_plus_minus_inert_on_switch_list_until_o(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("plus", "minus")
+            await settle(pilot)
+            assert not any(c[0] == "swap" for c in fake.calls)
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.press("plus")
+            await settle(pilot)
+            assert ("swap", "1", "2") in fake.calls
+
+    async def test_enter_does_not_switch_while_ordering(self, tmp_path):
+        """The reorder keys and the key that changes your login are one
+        keystroke apart, so only one of them is ever live."""
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.press("enter")
+            await settle(pilot)
+            from claude_swap.tui.dashboard import SwitchScreen
+
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+            assert isinstance(app.screen, SwitchScreen)  # nor did it pop
+
+    async def test_escape_leaves_order_mode_before_the_screen(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.press("escape")  # disarm only
+            await pilot.pause()
+            from claude_swap.tui.dashboard import DashboardScreen, SwitchScreen
+
+            assert isinstance(app.screen, SwitchScreen)
+            await pilot.press("plus")  # gate is back up
+            await settle(pilot)
+            assert not any(c[0] == "swap" for c in fake.calls)
+            await pilot.press("escape")  # now leave
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+
+    async def test_watch_o_arms_a_cursor_the_monitor_lacks(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            assert app.screen.query_one("#accounts", ListView_()).index is None
+            await pilot.press("o")
+            await pilot.pause()
+            assert app.screen.query_one("#accounts", ListView_()).index == 0
+            await pilot.press("escape")  # disarm -> hands-off again
+            await pilot.pause()
+            from claude_swap.tui.dashboard import WatchScreen
+
+            assert isinstance(app.screen, WatchScreen)
+            assert app.screen.query_one("#accounts", ListView_()).index is None
+
+    async def test_watch_modes_are_mutually_exclusive(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("s")  # switch-selection armed
+            await pilot.pause()
+            await pilot.press("o")  # reorder takes the cursor over
+            await pilot.pause()
+            screen = app.screen
+            assert screen._ordering and not screen._selecting
+            await pilot.press("enter")  # inert in reorder mode
+            await settle(pilot)
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+            await pilot.press("s")  # and back the other way
+            await pilot.pause()
+            assert screen._selecting and not screen._ordering
+            await pilot.press("plus")
+            await settle(pilot)
+            assert not any(c[0] == "swap" for c in fake.calls)
+            await pilot.press("enter")  # switching is live again
+            await settle(pilot)
+            assert ("switch_to", "1") in fake.calls
 
 
 def ListView_():

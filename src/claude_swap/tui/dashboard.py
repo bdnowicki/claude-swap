@@ -12,9 +12,10 @@ account-targeted opens a context of its own:
   watching*, Esc disarms.
 - "Remove account" nests into a submenu listing the accounts.
 
-Wherever a cursor exists, ``-``/``+`` move the selected account one place up
-or down the list — the accounts trade slot numbers, so their numeric
-shortcuts move with them.
+``o`` arms reorder mode on either list: ``-``/``+`` then move the selected
+account one place up or down (the accounts trade slot numbers, so their
+numeric shortcuts move with them) and Enter is inert, so the keys that
+reorder and the key that switches are never live at the same time.
 
 Mouse: a single click on an account only moves the cursor to it; a *double*
 click switches to that account. Nothing account-changing hangs off one click.
@@ -228,10 +229,13 @@ class AccountListScreen(Screen):
 
     app: "CswapApp"
 
+    _ORDER_TITLE = "reorder · -/+ move the selected account · esc done"
+
     def __init__(self) -> None:
         super().__init__()
         self._numbers: list[str] = []
         self._stamps: dict[str, float | None] = {}
+        self._ordering = False
 
     def compose(self) -> ComposeResult:
         yield Static("", id="list-title")
@@ -303,6 +307,39 @@ class AccountListScreen(Screen):
 
     # -- reordering ---------------------------------------------------------
 
+    def action_toggle_order(self) -> None:
+        self._set_ordering(not self._ordering)
+
+    def _set_ordering(self, on: bool) -> None:
+        """Arm or disarm reorder mode.
+
+        Armed, ``-``/``+`` are live and Enter is not — reordering an account
+        and switching to it are different intents, and one keystroke apart is
+        too close for a list where Enter changes which account you are logged
+        into. Arming also makes sure there is a cursor to reorder *from*: the
+        watch page has none until something asks for one.
+        """
+        self._ordering = on
+        listview = self.query_one("#accounts", ListView)
+        if on:
+            if listview.index is None:
+                snap = self.app.snapshot
+                if snap is not None and snap.accounts:
+                    listview.index = self._active_index(snap)
+            listview.focus()
+        self._render_title()
+        self.refresh_bindings()
+
+    def _render_title(self) -> None:
+        """Re-render ``#list-title`` for the current mode (subclass hook)."""
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "move":
+            return self._ordering  # hidden and inert until `o` arms it
+        if action == "select_highlighted" and self._ordering:
+            return False  # reorder mode: Enter must not switch accounts
+        return True
+
     def action_move(self, delta: int) -> None:
         """Move the selected account ``delta`` places down the list (-1 = up).
 
@@ -369,6 +406,7 @@ class SwitchScreen(AccountListScreen):
         # to the list cursor, so behavior is identical.
         Binding("enter", "select_highlighted", "Switch", priority=True),
         Binding("b", "app.switch_best", "Best pick"),
+        Binding("o", "toggle_order", "Reorder"),
         Binding("minus", "move(-1)", "Move up"),
         Binding("plus", "move(1)", "Move down"),
         Binding("escape,q,s", "back", "Back"),
@@ -376,12 +414,26 @@ class SwitchScreen(AccountListScreen):
         Binding("k", "cursor_up", show=False),
     ]
 
+    _PICK_TITLE = "switch to which account?"
+
+    def _render_title(self) -> None:
+        title = self._ORDER_TITLE if self._ordering else self._PICK_TITLE
+        self.query_one("#list-title", Static).update(title)
+
     def on_mount(self) -> None:
-        self.query_one("#list-title", Static).update("switch to which account?")
+        self._render_title()
         self.query_one("#accounts", ListView).focus()
         super().on_mount()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if self._ordering:
+            # `check_action` disables *this screen's* enter binding in reorder
+            # mode, but the focused ListView keeps its own hidden enter
+            # binding, and Textual falls through to it — which posts Selected
+            # all the same. The gate has to be here too, not only on the
+            # binding. (The watch screen's `_selecting` check does the same
+            # job for the same reason.)
+            return
         item = event.item
         if isinstance(item, AccountItem):
             self.app.do_switch(item.number)
@@ -398,27 +450,32 @@ class SwitchScreen(AccountListScreen):
             listview.action_select_cursor()
 
     def action_back(self) -> None:
-        self.app.pop_screen()
+        if self._ordering:
+            self._set_ordering(False)  # leave the mode before the screen
+        else:
+            self.app.pop_screen()
 
 
 class WatchScreen(AccountListScreen):
     """Live monitor of every account, full detail, hands-off by default.
 
-    ``s`` arms selection (cursor appears on the active account); Enter then
-    switches and stays here — you keep watching on the new account, and
-    ``-``/``+`` reorder the selected account without leaving either. Esc
-    disarms selection first, then leaves the screen.
+    Two modes can be armed, never both: ``s`` for switching (cursor appears
+    on the active account, Enter switches and stays here — you keep watching
+    on the new account) and ``o`` for reordering (``-``/``+`` move the
+    selected account, Enter inert). Esc disarms whichever is on, then leaves
+    the screen.
 
-    A double click switches without arming anything: it is a deliberate
-    gesture in a way Enter is not, which is the whole reason Enter is gated.
-    Either way the screen returns to hands-off monitoring afterwards.
+    A double click switches without arming anything, in any mode: it is a
+    deliberate gesture in a way Enter is not, which is the whole reason Enter
+    is gated. Either way the screen returns to hands-off monitoring after.
     """
 
     _WATCH_TITLE = "watching all accounts"
-    _SELECT_TITLE = "pick an account · enter switch · +/- reorder · esc cancel"
+    _SELECT_TITLE = "switch to which account? · enter confirm · esc cancel"
 
     BINDINGS = [
         Binding("s", "toggle_select", "Select"),
+        Binding("o", "toggle_order", "Reorder"),
         Binding("enter", "select_highlighted", "Switch", priority=True),
         Binding("minus", "move(-1)", "Move up"),
         Binding("plus", "move(1)", "Move down"),
@@ -434,46 +491,63 @@ class WatchScreen(AccountListScreen):
 
     def on_mount(self) -> None:
         self.watch(self.app, "refresh_status", self._on_refresh_status)
-        self.query_one("#list-title", Static).update(self._title_text())
+        self._render_title()
         super().on_mount()
 
     def _title_text(self) -> str:
         if self._selecting:
             return self._SELECT_TITLE
+        if self._ordering:
+            return self._ORDER_TITLE
         status = self.app.refresh_status
         return f"{self._WATCH_TITLE} · {status}" if status else self._WATCH_TITLE
 
+    def _render_title(self) -> None:
+        self.query_one("#list-title", Static).update(self._title_text())
+
     def _on_refresh_status(self, status: str) -> None:
-        if not self._selecting:
-            self.query_one("#list-title", Static).update(self._title_text())
+        if not (self._selecting or self._ordering):
+            self._render_title()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        if action in {"select_highlighted", "move"} and not self._selecting:
-            return False  # hidden and inert until selection is armed
-        return True
+        if action == "select_highlighted" and not self._selecting:
+            return False  # Enter is inert until selection is armed
+        return super().check_action(action, parameters)
 
     def _index_after_build(
         self, snap: AccountsSnapshot, first_build: bool, previous: int | None
     ) -> int | None:
-        if not self._selecting:
+        if not (self._selecting or self._ordering):
             return None  # monitor mode: no cursor at all
         return super()._index_after_build(snap, first_build, previous)
 
+    def _set_ordering(self, on: bool) -> None:
+        """Reorder mode replaces selection: one cursor, one meaning for it."""
+        if on:
+            self._selecting = False
+        super()._set_ordering(on)
+        if not on:
+            self._to_monitor()
+
     def _set_selecting(self, on: bool) -> None:
         self._selecting = on
-        listview = self.query_one("#accounts", ListView)
-        title = self.query_one("#list-title", Static)
         if on:
+            self._ordering = False
+            listview = self.query_one("#accounts", ListView)
             snap = self.app.snapshot
             if snap is not None and snap.accounts:
                 listview.index = self._active_index(snap)
             listview.focus()
-            title.update(self._SELECT_TITLE)
+            self._render_title()
         else:
-            listview.index = None
-            self.set_focus(None)
-            title.update(self._title_text())
+            self._to_monitor()
         self.refresh_bindings()
+
+    def _to_monitor(self) -> None:
+        """Back to hands-off: no cursor, no focus, the watch title again."""
+        self.query_one("#accounts", ListView).index = None
+        self.set_focus(None)
+        self._render_title()
 
     def action_toggle_select(self) -> None:
         self._set_selecting(not self._selecting)
@@ -503,19 +577,21 @@ class WatchScreen(AccountListScreen):
     def action_back(self) -> None:
         if self._selecting:
             self._set_selecting(False)
+        elif self._ordering:
+            self._set_ordering(False)
         else:
             self.app.pop_screen()
 
     def action_nav_down(self) -> None:
         listview = self.query_one("#accounts", ListView)
-        if self._selecting:
+        if self._selecting or self._ordering:
             listview.action_cursor_down()
         else:
             listview.scroll_down(animate=False)
 
     def action_nav_up(self) -> None:
         listview = self.query_one("#accounts", ListView)
-        if self._selecting:
+        if self._selecting or self._ordering:
             listview.action_cursor_up()
         else:
             listview.scroll_up(animate=False)

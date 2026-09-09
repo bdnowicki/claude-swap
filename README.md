@@ -166,7 +166,7 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
-In the account lists (`s` to switch, or `s` again on the watch page to pick an account), `-` and `+` move the selected account one place up or down. It trades slot numbers with its neighbour, so the account's numeric shortcut moves with it — the same thing `cswap move` does from the shell.
+In the account lists, `o` arms reorder mode: `-` and `+` then move the selected account one place up or down, and Enter is inert while it is armed, so the keys that reorder and the key that switches are never live together. A move trades slot numbers with the neighbouring account, so the account's numeric shortcut moves with it — the same thing `cswap move` does from the shell. Esc leaves the mode.
 
 With the mouse, a single click on an account only moves the cursor to it; a **double** click switches to that account. Nothing account-changing hangs off a single click, so a stray one is harmless.
 
