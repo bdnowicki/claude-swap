@@ -166,6 +166,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+In the account lists (`s` to switch, or `s` again on the watch page to pick an account), `-` and `+` move the selected account one place up or down. It trades slot numbers with its neighbour, so the account's numeric shortcut moves with it — the same thing `cswap move` does from the shell.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens

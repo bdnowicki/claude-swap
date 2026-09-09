@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 from functools import partial
+from typing import Callable
 
 from textual.app import App
 from textual.binding import Binding
@@ -70,6 +71,8 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
+        # Completion callback of the one in-flight action, if it wants one.
+        self._action_then: Callable[[bool], None] | None = None
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -232,6 +235,7 @@ class CswapApp(App):
                 )
         elif event.worker.group == "action":
             self.busy = False
+            self._finish_action(False)
             self.notify(f"Action failed: {event.worker.error}", severity="error")
         elif event.worker.group == "engine":
             self.notify(
@@ -241,11 +245,25 @@ class CswapApp(App):
 
     # -- mutating actions (single-flight, captured, off-thread) ---------------
 
-    def _start_action(self, label: str, fn, *, show_output: bool = False) -> None:
+    def _start_action(
+        self,
+        label: str,
+        fn,
+        *,
+        show_output: bool = False,
+        then: Callable[[bool], None] | None = None,
+    ) -> bool:
+        """Start one captured action off-thread; False if one is still running.
+
+        Callers that mirror the action in the UI before it lands (the account
+        lists move their cursor with a reorder) need to know it was refused,
+        and ``then`` tells them how it ended — see :meth:`_finish_action`.
+        """
         if self.busy:
             self.notify("Another action is still running", severity="warning")
-            return
+            return False
         self.busy = True
+        self._action_then = then
         self.run_worker(
             partial(self._action_blocking, label, fn, show_output),
             thread=True,
@@ -253,16 +271,31 @@ class CswapApp(App):
             exit_on_error=False,
             name=label,
         )
+        return True
 
     def _action_blocking(self, label: str, fn, show_output: bool) -> None:
         result = run_action(fn)
         self.call_from_thread(self._action_done, label, result, show_output)
+
+    def _finish_action(self, ok: bool) -> None:
+        """Hand the outcome to the action's completion callback, exactly once.
+
+        Actions are single-flight, so one slot holds it. Both endings run
+        through here — the captured result in :meth:`_action_done`, and a
+        worker crash in :meth:`on_worker_state_changed`, which ``run_action``
+        never sees. A caller that undoes an optimistic UI change on failure
+        would otherwise leave it standing on the path it cannot observe.
+        """
+        then, self._action_then = self._action_then, None
+        if then is not None:
+            then(ok)
 
     def _action_done(
         self, label: str, result: ActionResult, show_output: bool
     ) -> None:
         self.busy = False
         self.request_refresh()
+        self._finish_action(result.ok)
         if not result.ok:
             self.push_screen(OutputModal(f"{label} — failed", result.output))
             return
@@ -309,6 +342,24 @@ class CswapApp(App):
         self._start_action(
             f"{verb} account {number}",
             partial(self.switcher.set_account_disabled, number, target),
+        )
+
+    def do_reorder(
+        self, first: str, second: str, *, then: Callable[[bool], None] | None = None
+    ) -> bool:
+        """Exchange two accounts' slot numbers; the display order follows them.
+
+        Every account list is in slot-number order, so "move one place up or
+        down" is a swap with the neighbouring *slot* — which is what callers
+        pass. Nothing is reported on success: the list visibly reorders on the
+        refresh that follows. Returns False when the action was refused (so
+        the caller can leave its cursor where it was), and calls ``then`` with
+        the outcome once it lands.
+        """
+        return self._start_action(
+            f"Reorder accounts {first} and {second}",
+            partial(self.switcher.swap_accounts, first, second),
+            then=then,
         )
 
     def confirm_remove(self, number: str, email: str) -> None:

@@ -12,6 +12,10 @@ account-targeted opens a context of its own:
   watching*, Esc disarms.
 - "Remove account" nests into a submenu listing the accounts.
 
+Wherever a cursor exists, ``-``/``+`` move the selected account one place up
+or down the list — the accounts trade slot numbers, so their numeric
+shortcuts move with them.
+
 No global command palette: actions live where their context is.
 """
 
@@ -294,6 +298,64 @@ class AccountListScreen(Screen):
     def action_cursor_up(self) -> None:
         self.query_one("#accounts", ListView).action_cursor_up()
 
+    # -- reordering ---------------------------------------------------------
+
+    def action_move(self, delta: int) -> None:
+        """Move the selected account ``delta`` places down the list (-1 = up).
+
+        The list is in slot-number order, so a move is a swap of two *slots* —
+        and that is how it is expressed: row *i* always holds
+        ``self._numbers[i]``, because trading two accounts' numbers never
+        changes which numbers exist. Passing numbers rather than "whichever
+        account the last snapshot put on this row" keeps a second keypress
+        correct while the refresh behind the first one is still in flight.
+
+        The cursor moves with the account straight away — a swap takes a file
+        lock, and waiting for it would make the key feel dead — and
+        :meth:`_reorder_done` puts it back if the swap turns out to fail.
+        """
+        listview = self.query_one("#accounts", ListView)
+        index = listview.index
+        if index is None or not 0 <= index < len(self._numbers):
+            return  # no cursor (monitor mode) or an empty list
+        target = index + delta
+        if not 0 <= target < len(self._numbers):
+            edge = "first" if delta < 0 else "last"
+            self.app.notify(f"Already {edge} in the list", timeout=2)
+            return
+        started = self.app.do_reorder(
+            self._numbers[index],
+            self._numbers[target],
+            then=partial(self._reorder_done, index, target, tuple(self._numbers)),
+        )
+        if started:
+            listview.index = target
+
+    def _reorder_done(
+        self, source: int, target: int, numbers: tuple[str, ...], ok: bool
+    ) -> None:
+        """Undo :meth:`action_move`'s optimistic cursor move if the swap failed.
+
+        Only when the view still looks exactly as it was left: the list is
+        still there, the same slots are in it, and the cursor has not been
+        moved since. A swap can fail slowly (a live session-mode claude on the
+        slot, an unreadable keychain), and by then the user may have arrowed
+        elsewhere, rebuilt the list, or left the screen — yanking the cursor
+        then would be worse than the stale highlight this repairs.
+
+        The list is looked up by query rather than by ``is_mounted``: a popped
+        screen still reports itself mounted after its children are gone, so
+        the flag is not the question worth asking here.
+        """
+        if ok:
+            return
+        rows = self.query("#accounts")
+        if not rows:
+            return
+        listview = rows.first(ListView)
+        if listview.index == target and tuple(self._numbers) == numbers:
+            listview.index = source
+
 
 class SwitchScreen(AccountListScreen):
     """All accounts, full-size and alive: arrows pick, Enter switches."""
@@ -304,6 +366,8 @@ class SwitchScreen(AccountListScreen):
         # to the list cursor, so behavior is identical.
         Binding("enter", "select_highlighted", "Switch", priority=True),
         Binding("b", "app.switch_best", "Best pick"),
+        Binding("minus", "move(-1)", "Move up"),
+        Binding("plus", "move(1)", "Move down"),
         Binding("escape,q,s", "back", "Back"),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
@@ -333,16 +397,19 @@ class WatchScreen(AccountListScreen):
     """Live monitor of every account, full detail, hands-off by default.
 
     ``s`` arms selection (cursor appears on the active account); Enter then
-    switches and stays here — you keep watching on the new account. Esc
+    switches and stays here — you keep watching on the new account, and
+    ``-``/``+`` reorder the selected account without leaving either. Esc
     disarms selection first, then leaves the screen.
     """
 
     _WATCH_TITLE = "watching all accounts"
-    _SELECT_TITLE = "switch to which account? · enter confirm · esc cancel"
+    _SELECT_TITLE = "pick an account · enter switch · +/- reorder · esc cancel"
 
     BINDINGS = [
-        Binding("s", "toggle_select", "Switch"),
-        Binding("enter", "select_highlighted", "Confirm", priority=True),
+        Binding("s", "toggle_select", "Select"),
+        Binding("enter", "select_highlighted", "Switch", priority=True),
+        Binding("minus", "move(-1)", "Move up"),
+        Binding("plus", "move(1)", "Move down"),
         Binding("f", "app.refresh_full", "Refresh", show=False),
         Binding("escape,q", "back", "Back"),
         Binding("down,j", "nav_down", show=False),
@@ -369,7 +436,7 @@ class WatchScreen(AccountListScreen):
             self.query_one("#list-title", Static).update(self._title_text())
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        if action == "select_highlighted" and not self._selecting:
+        if action in {"select_highlighted", "move"} and not self._selecting:
             return False  # hidden and inert until selection is armed
         return True
 
