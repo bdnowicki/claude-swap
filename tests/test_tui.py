@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
+from claude_swap.exceptions import ConfigError
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -159,6 +160,23 @@ class FakeSwitcher:
         self.calls.append(("switch", strategy))
         return {"switched": False, "from": None, "to": None, "reason": "no-better-target"}
 
+    def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
+        """Trade two slots' occupants, as the real switcher does: the numbers
+        stay where they are and the accounts move between them."""
+        self.calls.append(("swap", str(first), str(second)))
+        by_num = {a.number: a for a in self._accounts}
+        a, b = by_num[str(first)], by_num[str(second)]
+        moved = {
+            str(first): dataclasses.replace(b, number=str(first)),
+            str(second): dataclasses.replace(a, number=str(second)),
+        }
+        self._accounts = [moved.get(acc.number, acc) for acc in self._accounts]
+        if self.active == str(first):
+            self.active = str(second)
+        elif self.active == str(second):
+            self.active = str(first)
+        return str(first), str(second)
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         self.calls.append(("remove", str(identifier), assume_yes))
         self._accounts = [a for a in self._accounts if a.number != str(identifier)]
@@ -238,6 +256,31 @@ class BlockingSnapshotSwitcher(FakeSwitcher):
         )
 
 
+class FailingSwapSwitcher(FakeSwitcher):
+    """Fake whose reorder fails — optionally not before the test says so."""
+
+    def __init__(
+        self,
+        accounts: list[AccountSnapshot],
+        backup_dir: Path,
+        *,
+        error: Exception | None = None,
+        gated: bool = False,
+    ):
+        super().__init__(accounts, backup_dir)
+        self._error = error or ConfigError("a live session holds that slot")
+        self._gated = gated
+        self.swap_started = threading.Event()
+        self.swap_release = threading.Event()
+
+    def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
+        self.calls.append(("swap", str(first), str(second)))
+        self.swap_started.set()
+        if self._gated:
+            self.swap_release.wait(timeout=2)
+        raise self._error
+
+
 def make_app(fake: FakeSwitcher):
     from claude_swap.tui.app import CswapApp
 
@@ -256,6 +299,22 @@ async def settle(pilot) -> None:
         await app.workers.wait_for_complete(pending)
     await pilot.pause()
     await pilot.pause()
+
+
+async def settle_after_worker_error(pilot) -> None:
+    """`settle` for an action expected to end its worker in ERROR.
+
+    The app handles that through ``on_worker_state_changed``, but
+    ``Worker.wait`` re-raises it — and whether the errored worker is still
+    listed when we get here is a race, so tolerate both.
+    """
+    from textual.worker import WorkerFailed
+
+    try:
+        await settle(pilot)
+    except WorkerFailed:
+        await pilot.pause()
+        await pilot.pause()
 
 
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
@@ -1276,6 +1335,221 @@ class TestWatchScreen:
             app._update_refresh_status()
             await pilot.pause()
             assert "refreshing" in title.render().plain
+
+
+@pytest.mark.asyncio
+class TestReorder:
+    """`-`/`+` on the selected account move it up/down the list.
+
+    List order follows the slot numbers, so a move trades two slots — the
+    account's numeric shortcut moves with it.
+    """
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+
+    async def _switch_screen(self, pilot):
+        """Open the switch list; the cursor starts on the active account (1)."""
+        await settle(pilot)
+        await pilot.press("s")
+        await pilot.pause()
+
+    async def test_plus_moves_selected_account_down_cursor_follows(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            await pilot.press("plus")
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            assert ("swap", "1", "2") in fake.calls
+            # The accounts traded numbers; the list stays in number order.
+            assert [(a.number, a.email) for a in app.snapshot.accounts] == [
+                ("1", "user2@example.com"),
+                ("2", "user1@example.com"),
+                ("3", "user3@example.com"),
+            ]
+            # Cursor rode along with the account it moved.
+            assert app.screen.query_one("#accounts", ListView).index == 1
+
+    async def test_minus_moves_selected_account_up(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            await pilot.press("down", "down")  # cursor on account 3
+            await pilot.pause()
+            await pilot.press("minus")
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            assert ("swap", "3", "2") in fake.calls
+            assert [(a.number, a.email) for a in app.snapshot.accounts] == [
+                ("1", "user1@example.com"),
+                ("2", "user3@example.com"),
+                ("3", "user2@example.com"),
+            ]
+            assert app.screen.query_one("#accounts", ListView).index == 1
+
+    async def test_repeated_press_walks_the_same_account(self, tmp_path):
+        """A move is expressed as "swap these two slot numbers", never as
+        "whatever the last snapshot put on this row" — so the second press
+        keeps moving the account the first one moved."""
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            await pilot.press("plus")
+            await settle(pilot)
+            await pilot.press("plus")
+            await settle(pilot)
+            assert [c for c in fake.calls if c[0] == "swap"] == [
+                ("swap", "1", "2"),
+                ("swap", "2", "3"),
+            ]
+            assert [(a.number, a.email) for a in app.snapshot.accounts] == [
+                ("1", "user2@example.com"),
+                ("2", "user3@example.com"),
+                ("3", "user1@example.com"),
+            ]
+
+    async def test_edges_are_a_no_op_with_a_note(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            await pilot.press("minus")  # already first
+            await settle(pilot)
+            await pilot.press("down", "down")
+            await pilot.pause()
+            await pilot.press("plus")  # already last
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            assert not any(c[0] == "swap" for c in fake.calls)
+            assert app.screen.query_one("#accounts", ListView).index == 2
+
+    async def test_refused_while_busy_leaves_the_cursor_put(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            app.busy = True  # another action still in flight
+            await pilot.press("plus")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            assert not any(c[0] == "swap" for c in fake.calls)
+            assert app.screen.query_one("#accounts", ListView).index == 0
+
+    async def test_watch_screen_reorders_only_once_armed(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.press("plus")  # inert while just watching
+            await settle(pilot)
+            assert not any(c[0] == "swap" for c in fake.calls)
+            await pilot.press("s")  # arm selection
+            await pilot.pause()
+            await pilot.press("plus")
+            await settle(pilot)
+            from claude_swap.tui.dashboard import WatchScreen
+
+            assert ("swap", "1", "2") in fake.calls
+            assert isinstance(app.screen, WatchScreen)  # stayed watching
+
+    async def test_failed_reorder_puts_the_cursor_back(self, tmp_path):
+        fake = FailingSwapSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            screen = app.screen
+            await pilot.press("plus")
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            from claude_swap.tui.modals import OutputModal
+
+            assert isinstance(app.screen, OutputModal)  # the failure is reported
+            # The optimistic move is undone: the cursor marks the account that
+            # did not move, not its neighbour.
+            assert screen.query_one("#accounts", ListView).index == 0
+
+    async def test_crash_outside_run_action_also_puts_the_cursor_back(self, tmp_path):
+        """A non-ClaudeSwitchError escapes `run_action` and ends the worker in
+        ERROR, so `_action_done` never runs — the callback fires anyway."""
+        fake = FailingSwapSwitcher(
+            [make_account(1, active=True), make_account(2)],
+            tmp_path,
+            error=RuntimeError("boom"),
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            screen = app.screen
+            await pilot.press("plus")
+            await settle_after_worker_error(pilot)
+            from textual.widgets import ListView
+
+            assert screen.query_one("#accounts", ListView).index == 0
+            assert app.busy is False
+
+    async def test_failure_leaves_a_cursor_the_user_moved_alone(self, tmp_path):
+        fake = FailingSwapSwitcher(
+            [make_account(1, active=True), make_account(2), make_account(3)],
+            tmp_path,
+            gated=True,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            screen = app.screen
+            await pilot.press("plus")  # cursor moves 0 -> 1 with the account
+            await wait_event(fake.swap_started)
+            await pilot.press("down")  # user arrows on while the swap is in flight
+            await pilot.pause()
+            fake.swap_release.set()
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            # Revert only repairs a cursor still sitting where it was left.
+            assert screen.query_one("#accounts", ListView).index == 2
+
+    async def test_leaving_the_screen_mid_flight_is_safe(self, tmp_path):
+        fake = FailingSwapSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path, gated=True
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            await pilot.press("plus")
+            await wait_event(fake.swap_started)
+            await pilot.press("escape")  # pops the list out from under the callback
+            await pilot.pause()
+            fake.swap_release.set()
+            await settle(pilot)
+            from claude_swap.tui.modals import OutputModal
+
+            assert isinstance(app.screen, OutputModal)  # reported, app still alive
+
+    async def test_single_account_cannot_move(self, tmp_path):
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._switch_screen(pilot)
+            await pilot.press("plus", "minus")
+            await settle(pilot)
+            assert not any(c[0] == "swap" for c in fake.calls)
 
 
 def fake_calls(app) -> list[tuple]:
