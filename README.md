@@ -105,6 +105,8 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
+- **Dollar-budget accounts** — an Enterprise plan reports no 5h/7d windows at all; it is gated by a monthly credit pool instead, shown as the `$$` row in `cswap list`. Such an account is now measured on the pool that actually gates it, so auto-switch can weigh it like any other. (Previously its usage read as "unknown", and after a few checks the engine failed over off it as if it were broken — while it was sitting at 30% of its budget.) `cswap config set autoswitch.budgetAccounts reserve` holds one back as overflow, eligible only once every other account is spent; `exclude` keeps it out of automation entirely, while leaving it a valid explicit `cswap switch <num|email>` target. The default, `rank`, lets it compete on remaining quota like any other account — worth a thought before you leave it there, because 30% of a 5-hour window is back in hours and 30% of a monthly pool is back on the first of the month.
+  - An Enterprise plan may also show one or more `plan` rows above the `$$` row: dollar pools included with the plan, spent before the credits are. A `plan` row at 100% is normal and does not mean the account is blocked — usage simply falls through to the next pool, and the `$$` row is the one that decides when the account is really out.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -278,6 +280,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.budgetAccounts reserve  # spend a dollar-budget account last
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -335,6 +338,8 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
+
+A dollar-budget account (an Enterprise plan, which reports no window keys at all) carries a `budget` array instead of `fiveHour`/`sevenDay` — one entry per dollar pool included with the plan, each with a `name` (`"plan"`, `"plan 2"`, …), `pct`, `used`/`limit` in dollars, and `resetsAt`/`countdown`/`clock` when that pool has a reset — alongside the usual `spend` object for its credit pool. Join on `name`: the API's own key for each pool is a rotating server-side code name and is deliberately not emitted, so a script keying on it would read as stable for weeks and then break silently. Pace fields never appear on a dollar pool.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 

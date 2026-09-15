@@ -590,7 +590,8 @@ def _auto_command(argv: list[str]) -> None:
         prog="cswap auto",
         description=(
             "Automatically switch accounts when the active one nears its "
-            "5h/7d rate limit. Runs a foreground polling loop; use --once "
+            "limit — the 5h/7d rate limit, or the spending limit on a "
+            "dollar-budget plan. Runs a foreground polling loop; use --once "
             "for a single tick (cron-friendly)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -633,8 +634,9 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when the active account's binding window reaches this "
+            "utilization — 5h/7d, or the money pool on a dollar-budget plan "
+            "(50-99.9; default 90)"
         ),
     )
     parser.add_argument(
@@ -1114,7 +1116,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         choices=["best", "next-available"],
         metavar="{best,next-available}",
         help=(
-            "With bare 'switch': pick the target by remaining 5h/7d quota. "
+            "With bare 'switch': pick the target by remaining quota. "
             "'best' jumps to the account with the most headroom; "
             "'next-available' rotates to the next account, skipping any at their limit"
         ),
