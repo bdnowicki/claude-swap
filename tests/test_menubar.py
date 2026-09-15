@@ -116,6 +116,30 @@ _USAGE = {
 }
 
 
+def _budget_usage():
+    """The normalized usage of the Enterprise account captured 2026-09-15.
+
+    No 5h/7d/scoped window exists on it at all; its included $1,000 plan pool
+    is spent (100%, resetting in 2d 8h) and requests fall through to the $200
+    credit pool at 30.615%. Built as a function so each test gets its own dict
+    and a ``resets_at`` relative to ``_NOW``.
+    """
+    return {
+        "spend": {"used": 61.23, "limit": 200.0, "pct": 30.615, "currency": "USD"},
+        "budget": [
+            {
+                "key": "cinder_cove",
+                "name": "plan",
+                "pct": 100.0,
+                "resets_at": _iso(2 * 86400 + 8 * 3600),
+                "clock": "Sep 18 04:10",
+                "used": 1000.0,
+                "limit": 1000.0,
+            }
+        ],
+    }
+
+
 # --- usage display helpers -----------------------------------------------------
 
 def test_tightest_pct_uses_max_window():
@@ -125,7 +149,18 @@ def test_tightest_pct_uses_max_window():
 def test_tightest_pct_none_for_non_dict_or_empty():
     assert menubar.tightest_pct("no credentials") is None
     assert menubar.tightest_pct(None) is None
-    assert menubar.tightest_pct({"spend": {"pct": 90.0}}) is None  # no 5h/7d
+    assert menubar.tightest_pct({}) is None
+    # An account with no rate windows is gated by money, so its spend IS the
+    # binding pool. This used to assert None ("no 5h/7d") — that is the blind
+    # spot that showed a healthy Enterprise account as unmeasurable.
+    assert menubar.tightest_pct({"spend": {"pct": 90.0}}) == 90.0
+
+
+def test_tightest_pct_budget_account_reports_credits_not_spent_plan():
+    # The plan pool sits at 100% while the account serves requests normally off
+    # its credits (measured 2026-09-15), so the credit pool binds — a max()
+    # across the pools would call this healthy account exhausted.
+    assert menubar.tightest_pct(_budget_usage()) == 30.615
 
 
 def test_usage_summary_dict():
@@ -161,6 +196,42 @@ def test_usage_summary_scoped_multiple_and_countdown():
         ],
     }
     assert menubar.usage_summary(usage, _NOW) == "Fable 4% (2h 0m) · Opus 55%"
+
+
+def test_usage_summary_budget_account_shows_its_money_pools():
+    # Plan pool first, credits last — the order they are consumed.
+    out = menubar.usage_summary(_budget_usage(), _NOW)
+    assert out == "plan 100% (!) (2d 8h) · $ 31%"
+
+
+def test_usage_summary_marks_exhausted_credits_on_a_budget_account():
+    # Credits are the last pool in the chain and this org cannot buy more, so
+    # at 100% the account really is done until the monthly reset.
+    usage = _budget_usage()
+    usage["spend"]["pct"] = 100.0
+    assert menubar.usage_summary(usage, _NOW) == "plan 100% (!) (2d 8h) · $ 100% (!)"
+
+
+def test_usage_summary_never_marks_exhausted_credits_on_a_window_account():
+    # Same 100%, different meaning: oauth.relevant_windows refuses to let
+    # spend bind for an account with rate windows, because credits keep
+    # serving past a maxed 5h/7d. Marking it would contradict that.
+    usage = {**_USAGE, "spend": {"pct": 100.0, "used": 10.0, "limit": 10.0}}
+    assert menubar.usage_summary(usage) == "5h 42% · 7d 18% · $ 100%"
+
+
+def test_usage_summary_window_account_ignores_absent_budget():
+    # The regression baseline: a window account carries no ``budget`` key, so
+    # its line is byte-identical to before.
+    assert menubar.usage_summary(_USAGE) == "5h 42% · 7d 18% · $ 30%"
+
+
+def test_usage_summary_budget_pool_never_shows_pace_marker():
+    # compute_pace projects a weekly window against its reset; a budget pool
+    # has no such cadence, so it must never be labelled "(ahead)".
+    usage = _budget_usage()
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert "ahead" not in out
 
 
 def test_usage_summary_string_sentinel_passthrough():
@@ -263,7 +334,24 @@ def test_format_usage_log_partial_window():
 def test_format_usage_log_none_when_no_numeric_window():
     assert menubar.format_usage_log("a@x.com", None) is None
     assert menubar.format_usage_log("a@x.com", "rate limited") is None
-    assert menubar.format_usage_log("a@x.com", {"spend": {"pct": 5.0}}) is None
+    assert menubar.format_usage_log("a@x.com", {}) is None
+
+
+def test_format_usage_log_budget_account_logs_its_money_pools():
+    # A dollar-budget account used to log nothing at all: the only trail of the
+    # failover it provoked was an autoswitch state file full of nulls. It now
+    # logs the pools that gate it, in consumption order.
+    assert menubar.format_usage_log("a@x.com", _budget_usage()) == (
+        "usage a@x.com: plan 100% (resets Sep 18 04:10) · $ 31%"
+    )
+
+
+def test_format_usage_log_window_account_never_logs_its_credits():
+    # For an account that HAS rate windows, credits are a separate axis that
+    # keeps working past a maxed 5h/7d — the log line stays about the windows.
+    assert menubar.format_usage_log("a@x.com", _USAGE) == (
+        "usage a@x.com: 5h 42% · 7d 18%"
+    )
 
 
 def test_usage_log_key_ignores_clock_tracks_pct():
@@ -273,6 +361,20 @@ def test_usage_log_key_ignores_clock_tracks_pct():
     assert menubar._usage_log_key(u1) == menubar._usage_log_key(u2)  # clock-only change
     assert menubar._usage_log_key(u1) != menubar._usage_log_key(u3)  # pct change
     assert menubar._usage_log_key(None) == (None, None)
+
+
+def test_usage_log_key_tracks_budget_pcts_and_stays_loggable():
+    # ``_log_usage`` skips an account whose key is exactly (None, None), so a
+    # budget account's key has to extend past that pair or its line would be
+    # built and then never logged.
+    usage = _budget_usage()
+    key = menubar._usage_log_key(usage)
+    assert key != (None, None)
+    assert key[:2] == (None, None)  # it genuinely has no 5h/7d window
+    spent = _budget_usage()
+    spent["spend"]["pct"] = 100.0
+    assert menubar._usage_log_key(spent) != key  # credits moving re-logs
+    assert menubar._usage_log_key(_USAGE) == (42.0, 18.0)  # window account: unchanged
 
 
 # --- title ---------------------------------------------------------------------
@@ -361,6 +463,20 @@ def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
     assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+
+
+def test_format_title_budget_account_shows_its_binding_pct():
+    # Neither window the "5h"/"7d"/"both" choices name exists on this account,
+    # so the title was the bare icon. One segment, the pool that binds (its
+    # credits at 30.615%), not the spent plan pool at 100%.
+    for choice in ("5h", "7d", "both"):
+        s = menubar.MenuBarSettings(show_account_name=False, title_pct=choice)
+        assert menubar.format_title("loc@x.com", _budget_usage(), s, _NOW) == "⇄ 31%"
+
+
+def test_format_title_budget_account_respects_pct_off():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    assert menubar.format_title("loc@x.com", _budget_usage(), s, _NOW) == "⇄ loc"
 
 
 # --- reset-time helpers --------------------------------------------------------

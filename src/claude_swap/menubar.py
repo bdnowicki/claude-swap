@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
@@ -131,18 +131,23 @@ class MenuBarSettings:
 # ---- oauth.build_usage_result / stored in UsageEntry.last_good) --------------
 
 def tightest_pct(usage: dict | str | None) -> float | None:
-    """Highest 5h/7d utilization percentage, or None if unknown.
+    """Utilization of whatever pool binds this account, or None if unknown.
 
-    Surfaces the binding window's utilization for display. Spend is excluded —
-    it isn't a rate-limit window.
+    For a window-based account that is the higher of the 5h and 7d windows;
+    spend is excluded, because credits keep working past a maxed rate window
+    and folding them in would misreport how close to blocked the account is.
+
+    A dollar-budget (Enterprise) account has no rate windows at all, so the
+    pool that gates it is money — its credits, else its plan budget. Reading
+    that as "unknown" is the bug this whole change is about: it is what let
+    ``cswap auto`` fail over off a perfectly healthy account.
+
+    Deliberately derived from ``oauth.relevant_windows`` rather than picking
+    the windows apart here, so there is exactly one definition of "binding"
+    across the CLI, the engine and this surface. With no ``models`` filter it
+    returns precisely 5h/7d for a window account, so that case is unchanged.
     """
-    if not isinstance(usage, dict):
-        return None
-    pcts = [
-        window["pct"]
-        for window in (usage.get("five_hour"), usage.get("seven_day"))
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float))
-    ]
+    pcts = [pct for _label, pct, _resets in oauth.relevant_windows(usage)]
     return max(pcts) if pcts else None
 
 
@@ -153,6 +158,31 @@ def _window_pct(usage: dict | str | None, key: str) -> float | None:
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             return float(window["pct"])
     return None
+
+
+def _money_pools(usage: dict | str | None) -> list[tuple[str, dict]]:
+    """``[(label, window)]`` for a dollar-budget account, in spend order.
+
+    Its plan budget pools under their display labels ("plan", "plan 2", …),
+    then its credit pool as ``$``. Empty for every other account — including
+    a window-based one that happens to carry credits, where the 5h/7d segments
+    already say what binds and the existing spend segment already reports the
+    credits separately.
+
+    Enterprise accounts report no 5h/7d/scoped window at all (measured
+    2026-09-15), so every helper below that walks those keys found nothing to
+    say about them and the menu bar went blank for an account whose usage was
+    perfectly measurable. This is what those helpers show instead.
+    """
+    if not isinstance(usage, dict) or not oauth.is_budget_account(usage):
+        return []
+    pools: list[tuple[str, dict]] = [
+        (w["name"], w) for w in oauth.budget_windows(usage)
+    ]
+    spend = usage.get("spend")
+    if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+        pools.append(("$", spend))
+    return pools
 
 
 def _resets_at_ts(window: dict | str | None) -> float:
@@ -228,6 +258,12 @@ def usage_summary(
     ``fetched_at`` is the underlying measurement's fetch time (may be older
     than ``now`` when serving last-good data) — used only to flag a weekly
     window that's meaningfully ahead of pace (issue #125), never the 5h one.
+
+    A dollar-budget account reports none of the 5h/7d/scoped windows, so its
+    line is its money instead: the plan pools lead it and the credit pool
+    closes it, either marked ``(!)`` once exhausted. Those markers belong to
+    that kind of account only — a Max account's credits at 100% are a spent
+    overflow axis, not a limit.
     """
     if isinstance(usage, str):
         return usage
@@ -236,6 +272,28 @@ def usage_summary(
     if now is None:
         now = time.time()
     parts: list[str] = []
+    # Whether money is what gates this account, decided once for every money
+    # segment on the line (the budget pools here and the spend segment at the
+    # end). It is what licenses the ``(!)``: on an account with rate windows,
+    # ``oauth.relevant_windows`` is documented to refuse to let spend bind —
+    # credits keep serving past a maxed 5h/7d — so marking that segment would
+    # be this display contradicting the decision layer. Not "is this pool in
+    # relevant_windows", which returns only the credit pool when one exists
+    # and would therefore strip the marker off a budget account's genuinely
+    # exhausted plan pool.
+    money_gated = oauth.is_budget_account(usage)
+    # Dollar-budget plans lead with their included pools, in the order they are
+    # actually consumed: the plan budget first, then the credit pool the spend
+    # segment at the end of this function reports. No pace marker — a budget
+    # pool has no weekly cadence to run ahead of. Empty on a window account.
+    for window in oauth.budget_windows(usage):
+        seg = f"{window['name']} {window['pct']:.0f}%"
+        if money_gated and window["pct"] >= 100:
+            seg += " (!)"  # pool exhausted; usage falls through to credits
+        countdown = _live_countdown(window, now)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
         pace_result = None
@@ -271,7 +329,10 @@ def usage_summary(
             parts.append(seg)
     spend = usage.get("spend")
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
-        parts.append(f"$ {spend['pct']:.0f}%")
+        seg = f"$ {spend['pct']:.0f}%"
+        if money_gated and spend["pct"] >= 100:
+            seg += " (!)"  # last pool in the chain — nothing left to fall to
+        parts.append(seg)
     return " · ".join(parts) if parts else "usage unavailable"
 
 
@@ -323,6 +384,17 @@ def format_title(
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
             segments.append(f"{p:.0f}%")
+    if settings.title_pct != "off" and _money_pools(active_usage):
+        # A dollar-budget account has neither of the windows the "5h"/"7d"
+        # choices name, so both blocks above find nothing and the title
+        # collapsed to the bare icon for an account whose usage was perfectly
+        # measurable. Any setting other than "off" means "show me how full
+        # this account is", so show the pool that actually binds it — its
+        # credits, else its plan budget (see ``tightest_pct``). One segment,
+        # not two: there is only ever one binding money pool.
+        p = tightest_pct(active_usage)
+        if p is not None:
+            segments.append(f"{p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
@@ -336,12 +408,19 @@ def format_title(
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
-    """A log line of an account's session (5h) and weekly (7d) limits.
+    """A log line of the limits that gate an account.
+
+    The session (5h) and weekly (7d) windows for a window-based account; for a
+    dollar-budget one, which reports neither, its money pools instead — the
+    plan budgets and then the credit pool, the same order every display
+    surface uses. Such an account used to log *nothing at all*, which is why
+    the ``cswap auto`` failover it provoked (see the ``leftHeadroom: null`` in
+    the recorded autoswitch state) left no usage trail to read afterwards.
 
     Uses each window's absolute reset ``clock`` rather than a live countdown,
-    since log lines are already timestamped. Returns ``None`` when no numeric
-    window is available (sentinels, ``None``, or spend-only) so callers can skip
-    logging nothing.
+    since log lines are already timestamped. Returns ``None`` when nothing
+    numeric is available (sentinels, ``None``, or an account with no measured
+    pool at all) so callers can skip logging nothing.
     """
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -354,18 +433,34 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
         if clock:
             seg += f" (resets {clock})"
         parts.append(seg)
+    for label, window in _money_pools(usage):
+        seg = f"{label} {float(window['pct']):.0f}%"
+        clock = window.get("clock")
+        if clock:
+            seg += f" (resets {clock})"
+        parts.append(seg)
     if not parts:
         return None
     return f"usage {email}: " + " · ".join(parts)
 
 
-def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None]:
-    """De-dupe key for usage logging: the (5h, 7d) percentages only.
+def _usage_log_key(usage: dict | str | None) -> tuple[float | None, ...]:
+    """De-dupe key for usage logging: the percentages the log line reports.
 
     Reset clocks change every refresh; keying on the percentages means an idle
     account isn't re-logged every cycle.
+
+    (5h, 7d) for a window account, and nothing else appended — the caller
+    treats exactly ``(None, None)`` as "nothing to log", so a window account
+    with no measured window must keep producing that pair. A dollar-budget
+    account's money pcts extend the key past it, which is precisely what makes
+    it loggable.
     """
-    return (_window_pct(usage, "five_hour"), _window_pct(usage, "seven_day"))
+    return (
+        _window_pct(usage, "five_hour"),
+        _window_pct(usage, "seven_day"),
+        *(float(window["pct"]) for _label, window in _money_pools(usage)),
+    )
 
 
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
@@ -621,8 +716,9 @@ def run(switcher) -> int:
             """Log each account's session/weekly limits when they change.
 
             Runs on every refresh (background thread; the logger is thread-safe)
-            but de-dupes per account on the (5h, 7d) percentages so an idle
-            machine doesn't churn the rotating log with identical lines.
+            but de-dupes per account on the percentages the line reports (see
+            ``_usage_log_key``) so an idle machine doesn't churn the rotating
+            log with identical lines.
             """
             for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
                 key = _usage_log_key(last_good)
