@@ -52,8 +52,16 @@ class TestAccountHeadroom:
         usage = {"spend": {"pct": 99.0}, "five_hour": {"pct": 10.0}}
         assert oauth.account_headroom(usage) == 90.0
 
+    def test_spend_binds_when_the_account_has_no_rate_windows(self):
+        # Was `test_no_window_data_is_unknown`'s first assertion, which
+        # expected None. A dollar-budget account reports no 5h/7d/scoped at
+        # all, so reading it as "unknown" is what made `cswap auto` fail over
+        # off a perfectly healthy Enterprise account. Money is the only gate it
+        # has, so money binds.
+        assert oauth.account_headroom({"spend": {"pct": 50.0}}) == 50.0
+
     def test_no_window_data_is_unknown(self):
-        assert oauth.account_headroom({"spend": {"pct": 50.0}}) is None
+        # Genuinely empty usage stays unknown — never auto-skipped.
         assert oauth.account_headroom({}) is None
 
     def test_none_and_non_dict_are_unknown(self):
@@ -1522,3 +1530,390 @@ class TestLoginExpiresAtIso:
     ])
     def test_anything_but_a_positive_epoch_is_unknown(self, creds):
         assert oauth.login_expires_at_iso(creds) is None
+
+
+# --- Dollar-budget (Enterprise) accounts -------------------------------------
+#
+# Both fixtures below are trimmed transcriptions of live
+# `GET /api/oauth/usage` responses captured 2026-09-15: one Enterprise account
+# gated by a dollar budget, one ordinary subscription account. Keep them shaped
+# like the wire format, null slots and all — the null-vs-absent distinction and
+# the `monthly_limit: 0` on the ordinary account are precisely what the parsing
+# has to get right.
+
+BUDGET_ACCOUNT_RESPONSE = {
+    "five_hour": None,
+    "seven_day": None,
+    "seven_day_opus": None,
+    "seven_day_sonnet": None,
+    "seven_day_cowork": None,
+    "seven_day_omelette": None,
+    "seven_day_oauth_apps": None,
+    "tangelo": None,
+    "iguana_necktie": None,
+    "omelette_promotional": None,
+    # Non-null on BOTH captured accounts, and carrying nothing but a zero
+    # utilization: presence is not an Enterprise marker, and this must never
+    # produce a row.
+    "nimbus_quill": {
+        "utilization": 0.0, "resets_at": None,
+        "limit_dollars": None, "used_dollars": None, "remaining_dollars": None,
+        "locked_reason": None,
+    },
+    # The plan's included dollar pool: spent, yet the account kept serving
+    # requests because usage falls through to the credit pool below.
+    "cinder_cove": {
+        "utilization": 100.0,
+        "resets_at": "2026-09-18T02:10:41.779260+00:00",
+        "limit_dollars": 1000, "used_dollars": 1000.0, "remaining_dollars": 0.0,
+        "locked_reason": None,
+    },
+    "copper_kite": None, "harbor_lantern": None, "amber_ladder": None,
+    "juniper_tide": None, "cedar_ember": None,
+    "extra_usage": {
+        "is_enabled": True, "monthly_limit": 20000, "used_credits": 6123.0,
+        "utilization": 30.615, "currency": "USD", "decimal_places": 2,
+        "disabled_reason": None, "user_disabled": False,
+        "spend_limit_reached": False, "credits_ever_enabled": True,
+        "daily": None, "weekly": None,
+    },
+    "limits": [],
+    "spend": {
+        "used": {"amount_minor": 6123, "currency": "USD", "exponent": 2},
+        "limit": {"amount_minor": 20000, "currency": "USD", "exponent": 2},
+        "percent": 31, "severity": "normal", "enabled": True,
+        "disabled_reason": None,
+        "cap": {"money": None, "credits": {"amount_minor": 20000, "exponent": 2}},
+        "balance": None, "auto_reload": None,
+        "can_purchase_credits": False, "can_toggle": False,
+    },
+    "member_dashboard_available": True,
+    "seven_day_breakdown": None,
+}
+
+WINDOW_ACCOUNT_RESPONSE = {
+    "five_hour": {"utilization": 0.0, "resets_at": None, "limit_dollars": None,
+                  "used_dollars": None, "remaining_dollars": None,
+                  "locked_reason": None},
+    "seven_day": {"utilization": 0.0, "resets_at": "2026-09-21T16:00:00+00:00",
+                  "limit_dollars": None, "used_dollars": None,
+                  "remaining_dollars": None, "locked_reason": None},
+    "nimbus_quill": {"utilization": 0.0, "resets_at": None,
+                     "limit_dollars": None, "used_dollars": None,
+                     "remaining_dollars": None, "locked_reason": None},
+    "cinder_cove": None,
+    # The trap: extra usage is *enabled* with a limit of 0. That is "no credit
+    # pool", not "a $0 pool that is spent".
+    "extra_usage": {"is_enabled": True, "monthly_limit": 0, "used_credits": 0.0,
+                    "utilization": None, "currency": "USD", "decimal_places": 2,
+                    "disabled_reason": None, "user_disabled": False},
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 0,
+         "resets_at": None, "scope": None, "is_active": True},
+        {"kind": "weekly_all", "group": "weekly", "percent": 0,
+         "resets_at": "2026-09-21T16:00:00+00:00", "scope": None,
+         "is_active": False},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0,
+         "resets_at": "2026-09-21T16:00:00+00:00",
+         "scope": {"model": {"id": None, "display_name": "Fable"},
+                   "surface": None},
+         "is_active": False},
+    ],
+    "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+              "limit": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+              "percent": 0, "severity": "normal", "enabled": True,
+              "cap": {"money": None,
+                      "credits": {"amount_minor": 0, "exponent": 2}}},
+    "member_dashboard_available": False,
+}
+
+
+def _without(response: dict, *keys: str) -> dict:
+    return {k: v for k, v in response.items() if k not in keys}
+
+
+class TestBudgetWindowParsing:
+    """build_usage_result's generic recognition of dollar pools."""
+
+    def test_dollar_pool_becomes_a_budget_window(self):
+        result = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)
+        assert len(result["budget"]) == 1
+        plan = result["budget"][0]
+        assert plan["name"] == "plan"
+        assert plan["pct"] == 100.0
+        assert plan["used"] == 1000.0
+        assert plan["limit"] == 1000.0
+        assert plan["resets_at"] == "2026-09-18T02:10:41.779260+00:00"
+        assert "countdown" in plan and "clock" in plan
+
+    def test_code_name_is_carried_but_is_never_the_label(self):
+        # The key rotates and means nothing to a user, so it may ride along for
+        # JSON/debug but the display name must be positional.
+        plan = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)["budget"][0]
+        assert plan["key"] == "cinder_cove"
+        assert plan["name"] == "plan"
+
+    def test_null_dollar_fields_are_not_a_budget_window(self):
+        # `nimbus_quill` is non-null on the budget account and still must not
+        # produce a row: only `limit_dollars` discriminates.
+        keys = [w["key"] for w in oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)["budget"]]
+        assert keys == ["cinder_cove"]
+
+    def test_window_account_reports_no_budget_at_all(self):
+        # Same `nimbus_quill` object arrives on an ordinary account (measured
+        # 2026-09-15) — nothing there is a budget.
+        result = oauth.build_usage_result(WINDOW_ACCOUNT_RESPONSE)
+        assert "budget" not in result
+        assert result["five_hour"]["pct"] == 0.0
+        assert result["seven_day"]["pct"] == 0.0
+        assert [w["name"] for w in result["scoped"]] == ["Fable"]
+
+    def test_a_never_seen_code_name_parses_generically(self):
+        # Nothing may be keyed on the current names: they rotate.
+        result = oauth.build_usage_result({
+            "velvet_harbor": {"utilization": 42.5, "resets_at": None,
+                              "limit_dollars": 500, "used_dollars": 212.5,
+                              "remaining_dollars": 287.5, "locked_reason": None},
+        })
+        assert result["budget"] == [
+            {"key": "velvet_harbor", "name": "plan", "pct": 42.5,
+             "used": 212.5, "limit": 500.0},
+        ]
+
+    def test_pools_are_numbered_in_api_order(self):
+        result = oauth.build_usage_result({
+            "cinder_cove": {"utilization": 100.0, "limit_dollars": 1000,
+                            "used_dollars": 1000.0},
+            "juniper_tide": {"utilization": 10.0, "limit_dollars": 250,
+                             "used_dollars": 25.0},
+            "amber_ladder": {"utilization": 0.0, "limit_dollars": 50,
+                             "used_dollars": None},
+        })
+        assert [(w["name"], w["limit"]) for w in result["budget"]] == [
+            ("plan", 1000.0), ("plan 2", 250.0), ("plan 3", 50.0),
+        ]
+        # A null `used_dollars` drops just that field, like every other window.
+        assert "used" not in result["budget"][2]
+
+    @pytest.mark.parametrize("pool", [
+        {"utilization": 50.0, "limit_dollars": 0},      # no pool, not a spent one
+        {"utilization": 50.0, "limit_dollars": -5},
+        {"utilization": 50.0, "limit_dollars": None},
+        {"utilization": 50.0, "limit_dollars": "1000"},
+        {"utilization": 50.0, "limit_dollars": True},   # bool is not a number
+        {"utilization": None, "limit_dollars": 1000},
+        {"utilization": True, "limit_dollars": 1000},
+        {"utilization": "100", "limit_dollars": 1000},
+    ])
+    def test_only_a_real_positive_limit_makes_a_budget(self, pool):
+        assert oauth.build_usage_result({"cinder_cove": pool}) is None
+
+    def test_unparseable_reset_costs_only_the_clock_strings(self):
+        result = oauth.build_usage_result({
+            "cinder_cove": {"utilization": 7.0, "resets_at": "whenever",
+                            "limit_dollars": 100, "used_dollars": 7.0},
+        })
+        plan = result["budget"][0]
+        assert plan["pct"] == 7.0
+        assert plan["resets_at"] == "whenever"
+        assert "countdown" not in plan and "clock" not in plan
+
+    def test_skipped_non_null_pools_are_logged_once(self, caplog):
+        # The discoverability valve for the next rotation of these names.
+        import logging
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)
+        lines = [
+            r.getMessage() for r in caplog.records
+            if "not read as budgets" in r.getMessage()
+        ]
+        assert len(lines) == 1
+        assert "nimbus_quill" in lines[0]
+        assert "cinder_cove" not in lines[0]   # it WAS read as a budget
+        assert "juniper_tide" not in lines[0]  # null slot: never a candidate
+        assert "extra_usage" not in lines[0]   # handled elsewhere
+
+    def test_a_response_of_only_noise_is_still_nothing(self):
+        assert oauth.build_usage_result({
+            "nimbus_quill": BUDGET_ACCOUNT_RESPONSE["nimbus_quill"],
+        }) is None
+
+
+class TestSpendGuards:
+    """The zero-limit trap and the top-level `spend` fallback."""
+
+    def test_zero_monthly_limit_is_no_pool_not_an_empty_one(self):
+        # THE regression to avoid: a 0/0 spend row reads as 100% used, and
+        # money can now bind a decision.
+        assert "spend" not in oauth.build_usage_result(WINDOW_ACCOUNT_RESPONSE)
+
+    def test_zero_limit_is_rejected_even_when_utilization_is_present(self):
+        result = oauth.build_usage_result({
+            "five_hour": {"utilization": 3.0},
+            "extra_usage": {"is_enabled": True, "monthly_limit": 0,
+                            "used_credits": 0.0, "utilization": 0.0},
+        })
+        assert "spend" not in result
+        assert result["five_hour"]["pct"] == 3.0
+
+    def test_extra_usage_wins_over_the_top_level_spend_object(self):
+        # Both describe the same pool; extra_usage carries the finer number
+        # (30.615 against the rounded 31), so it must stay the source.
+        spend = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)["spend"]
+        assert spend["pct"] == 30.615
+        assert spend["used"] == 61.23
+        assert spend["limit"] == 200.0
+        assert spend["currency"] == "USD"
+
+    def test_top_level_spend_is_used_when_extra_usage_yields_nothing(self):
+        result = oauth.build_usage_result(
+            {**BUDGET_ACCOUNT_RESPONSE, "extra_usage": None}
+        )
+        assert result["spend"] == {
+            "used": 61.23, "limit": 200.0, "pct": 31.0, "currency": "USD",
+        }
+
+    def test_top_level_spend_honours_the_same_zero_guard(self):
+        result = oauth.build_usage_result(
+            {**WINDOW_ACCOUNT_RESPONSE, "extra_usage": None}
+        )
+        assert "spend" not in result
+
+    def test_top_level_spend_scales_by_its_own_exponent(self):
+        result = oauth.build_usage_result({
+            "spend": {"used": {"amount_minor": 1500, "currency": "EUR",
+                               "exponent": 3},
+                      "limit": {"amount_minor": 90000, "currency": "EUR",
+                                "exponent": 3},
+                      "percent": 1.67},
+        })
+        assert result["spend"]["used"] == 1.5
+        assert result["spend"]["limit"] == 90.0
+        assert result["spend"]["currency"] == "EUR"
+
+    @pytest.mark.parametrize("sp", [
+        {"used": {"amount_minor": 1}, "limit": {"amount_minor": 100}},  # no percent
+        {"used": {"amount_minor": 1}, "percent": 1},                    # no limit
+        {"limit": {"amount_minor": 100}, "percent": 1},                 # no used
+        {"used": {"amount_minor": 1}, "limit": {"amount_minor": "100"},
+         "percent": 1},
+        {"used": {"amount_minor": 1}, "limit": {"amount_minor": 100},
+         "percent": True},
+    ])
+    def test_malformed_top_level_spend_yields_nothing(self, sp):
+        assert oauth.build_usage_result({"spend": sp}) is None
+
+
+class TestBudgetAccountClassification:
+    """has_rate_windows / is_budget_account / budget_windows."""
+
+    def test_captured_shapes(self):
+        budget = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)
+        window = oauth.build_usage_result(WINDOW_ACCOUNT_RESPONSE)
+        assert oauth.has_rate_windows(budget) is False
+        assert oauth.is_budget_account(budget) is True
+        assert oauth.has_rate_windows(window) is True
+        assert oauth.is_budget_account(window) is False
+
+    @pytest.mark.parametrize("usage", [None, {}, "api key", [], {"budget": []}])
+    def test_unknown_usage_is_not_a_budget_account(self, usage):
+        # "We could not measure this account" must never read as "budget".
+        assert oauth.is_budget_account(usage) is False
+        assert oauth.has_rate_windows(usage) is False
+        assert oauth.budget_windows(usage) == []
+
+    def test_scoped_only_account_with_credits_is_not_a_budget_account(self):
+        # has_rate_windows is deliberately independent of the `models` filter:
+        # a Max account whose config names no models still has rate windows,
+        # and its credits must stay a separate axis.
+        usage = {"scoped": [{"name": "Fable", "pct": 10.0}],
+                 "spend": {"pct": 99.0}}
+        assert oauth.has_rate_windows(usage) is True
+        assert oauth.is_budget_account(usage) is False
+        assert oauth.relevant_windows(usage) == []
+
+    def test_budget_alone_without_credits_is_a_budget_account(self):
+        usage = {"budget": [{"key": "cinder_cove", "name": "plan", "pct": 12.0,
+                             "limit": 1000.0}]}
+        assert oauth.is_budget_account(usage) is True
+        assert oauth.budget_windows(usage) == usage["budget"]
+
+    def test_budget_windows_filters_unusable_rows(self):
+        # A persisted `last_good` from an older/garbled row must not hand
+        # consumers something they have to re-validate.
+        usage = {"budget": [
+            "not a dict",
+            {"name": "plan", "pct": None},
+            {"pct": 10.0},
+            {"name": "plan", "pct": True},
+            {"name": "plan 2", "pct": 10.0},
+        ]}
+        assert oauth.budget_windows(usage) == [{"name": "plan 2", "pct": 10.0}]
+
+    def test_malformed_five_hour_does_not_count_as_a_rate_window(self):
+        assert oauth.has_rate_windows({"five_hour": {"pct": None}}) is False
+
+
+class TestBudgetRelevantWindows:
+    """relevant_windows / account_headroom for money-gated accounts."""
+
+    def test_credits_bind_not_the_exhausted_plan_pool(self):
+        # Measured 2026-09-15: the plan pool was at 100% while the account kept
+        # serving requests and credits kept climbing. max() over the pools
+        # would call this healthy account exhausted.
+        usage = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)
+        assert usage["budget"][0]["pct"] == 100.0
+        assert oauth.relevant_windows(usage) == [("$$", 30.615, None)]
+        assert oauth.account_headroom(usage) == pytest.approx(69.385)
+
+    def test_models_filter_does_not_disturb_the_budget_answer(self):
+        usage = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)
+        assert oauth.account_headroom(usage, ["Fable"]) == pytest.approx(69.385)
+        assert oauth.account_headroom(usage, ["all"]) == pytest.approx(69.385)
+
+    def test_exhausted_credits_are_at_limit(self):
+        usage = oauth.build_usage_result({
+            **BUDGET_ACCOUNT_RESPONSE,
+            "extra_usage": {**BUDGET_ACCOUNT_RESPONSE["extra_usage"],
+                            "used_credits": 20000.0, "utilization": 100.0},
+        })
+        assert oauth.account_headroom(usage) == 0.0
+
+    def test_plan_pool_binds_when_there_is_no_credit_pool(self):
+        usage = oauth.build_usage_result(
+            _without({**BUDGET_ACCOUNT_RESPONSE, "extra_usage": None}, "spend")
+        )
+        assert oauth.relevant_windows(usage) == [
+            ("plan", 100.0, "2026-09-18T02:10:41.779260+00:00"),
+        ]
+        assert oauth.account_headroom(usage) == 0.0
+
+    def test_every_plan_pool_is_listed_when_there_are_no_credits(self):
+        usage = {"budget": [
+            {"name": "plan", "pct": 100.0, "resets_at": "2026-09-18T02:10:41+00:00"},
+            {"name": "plan 2", "pct": 40.0},
+        ]}
+        assert oauth.relevant_windows(usage) == [
+            ("plan", 100.0, "2026-09-18T02:10:41+00:00"),
+            ("plan 2", 40.0, None),
+        ]
+        assert oauth.account_headroom(usage) == 0.0
+
+    def test_labels_stay_human_readable(self):
+        # These reach user-facing strings ("at X limit"), so a rotating API
+        # code name must never be one of them.
+        usage = oauth.build_usage_result(BUDGET_ACCOUNT_RESPONSE)
+        assert [label for label, _, _ in oauth.relevant_windows(usage)] == ["$$"]
+
+    def test_window_account_is_untouched(self):
+        usage = oauth.build_usage_result(WINDOW_ACCOUNT_RESPONSE)
+        assert oauth.relevant_windows(usage) == [
+            ("5h", 0.0, None),
+            ("7d", 0.0, "2026-09-21T16:00:00+00:00"),
+        ]
+        assert oauth.account_headroom(usage) == 100.0
+
+    def test_a_budget_account_with_neither_pool_is_still_unknown(self):
+        assert oauth.relevant_windows({"five_hour": {"pct": None}}) == []
+        assert oauth.account_headroom({"five_hour": {"pct": None}}) is None

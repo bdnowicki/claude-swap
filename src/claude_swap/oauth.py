@@ -461,6 +461,53 @@ def _log_usage_failure(
 
 
 
+def _is_real_number(value: object) -> bool:
+    """True for a JSON number, False for ``bool`` (and everything else).
+
+    ``isinstance(True, int)`` is True in Python, and these window objects carry
+    booleans and numbers side by side (``is_enabled`` next to ``utilization``),
+    so excluding bool is load-bearing rather than pedantic — a stray
+    ``"limit_dollars": true`` would otherwise parse as a $1 budget.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _money_dollars(amount: object) -> float | None:
+    """``{"amount_minor": 6123, "exponent": 2}`` -> ``61.23``, else None.
+
+    The newer top-level ``spend`` object states money in minor units with an
+    explicit exponent (measured 2026-09-15: USD/2 on both captured accounts).
+    A missing or nonsensical exponent falls back to 2 rather than dropping the
+    amount — losing the row entirely is worse than a scaling assumption that
+    is visible in the rendered number.
+    """
+    if not isinstance(amount, dict):
+        return None
+    minor = amount.get("amount_minor")
+    if not _is_real_number(minor):
+        return None
+    exponent = amount.get("exponent", 2)
+    if not isinstance(exponent, int) or isinstance(exponent, bool) or exponent < 0:
+        exponent = 2
+    return float(minor) / (10 ** exponent)
+
+
+# Top-level usage-API keys that are never candidate budget windows: the ones
+# normalized explicitly below, plus the two plain metadata keys. Everything
+# else is fair game for the generic budget recognition in
+# ``build_usage_result`` — the dollar pools arrive under rotating code names,
+# so the only workable rule is "anything unhandled shaped like a dollar pool".
+_NON_BUDGET_KEYS = frozenset({
+    "five_hour",
+    "seven_day",
+    "extra_usage",
+    "spend",
+    "limits",
+    "seven_day_breakdown",
+    "member_dashboard_available",
+})
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
@@ -494,18 +541,51 @@ def build_usage_result(data: dict) -> dict | None:
         utilization = eu.get("utilization")
         if used_credits is not None and monthly_limit is not None and utilization is not None:
             try:
-                spend_entry: dict = {
-                    "used": float(used_credits) / 100,
-                    "limit": float(monthly_limit) / 100,
-                    "pct": float(utilization),
-                    "currency": eu.get("currency", "USD"),
-                }
-                if eu.get("resets_at"):
-                    spend_entry["resets_at"] = eu["resets_at"]
-                    spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
-                result["spend"] = spend_entry
+                limit = float(monthly_limit) / 100
+                # A limit of 0 means "this account has no credit pool", never
+                # "a $0 pool, therefore spent". An ordinary window-based
+                # account reports is_enabled: true with monthly_limit: 0
+                # (measured 2026-09-15). Today its null ``utilization`` alone
+                # suppresses the row, but a 0/0 entry that ever slipped through
+                # would read as 100% used everywhere downstream — and
+                # ``relevant_windows`` now lets ``spend`` bind an account with
+                # no rate windows, so it would declare a healthy account
+                # exhausted. Make the zero explicit so it cannot regress.
+                if limit > 0:
+                    spend_entry: dict = {
+                        "used": float(used_credits) / 100,
+                        "limit": limit,
+                        "pct": float(utilization),
+                        "currency": eu.get("currency", "USD"),
+                    }
+                    if eu.get("resets_at"):
+                        spend_entry["resets_at"] = eu["resets_at"]
+                        spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+                    result["spend"] = spend_entry
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)
+
+    # Newer responses describe the same credit pool a second time, as a
+    # top-level ``spend`` object in minor units. It is strictly a fallback:
+    # ``extra_usage`` is the long-tested source and carries the finer-grained
+    # number (utilization 30.615 against this object's rounded percent 31,
+    # measured 2026-09-15 on one account at one instant), so it wins whenever
+    # it yields anything. Same zero guard for the same reason: an account with
+    # no credits sends this object too, with limit.amount_minor 0.
+    if "spend" not in result:
+        sp = data.get("spend")
+        if isinstance(sp, dict) and _is_real_number(sp.get("percent")):
+            limit_obj = sp.get("limit")
+            limit_amount = _money_dollars(limit_obj)
+            used_amount = _money_dollars(sp.get("used"))
+            if limit_amount is not None and used_amount is not None and limit_amount > 0:
+                currency = limit_obj.get("currency") if isinstance(limit_obj, dict) else None
+                result["spend"] = {
+                    "used": used_amount,
+                    "limit": limit_amount,
+                    "pct": float(sp["percent"]),
+                    "currency": currency if isinstance(currency, str) and currency else "USD",
+                }
 
     # Per-model weekly limits live in the newer ``limits`` array as
     # ``weekly_scoped`` entries carrying a ``scope.model.display_name`` (e.g.
@@ -532,7 +612,137 @@ def build_usage_result(data: dict) -> dict | None:
         if scoped:
             result["scoped"] = scoped
 
+    # Dollar-budget (Enterprise) plans report their included pools as top-level
+    # objects under ROTATING code names — "cinder_cove", "nimbus_quill",
+    # "harbor_lantern", "juniper_tide", "amber_ladder" ... all present and all
+    # but two null in the 2026-09-15 capture. The names are not stable API and
+    # mean nothing to a reader, so recognition is generic and keyed on shape:
+    # an unhandled dict whose ``utilization`` is a real number and whose
+    # ``limit_dollars`` is a real number > 0.
+    #
+    # That last clause is the entire discriminator. "nimbus_quill" arrives on
+    # BOTH a budget account and an ordinary one carrying utilization 0.0 and
+    # every dollar field null — presence proves nothing, and it must produce no
+    # row and bind no decision anywhere.
+    budget: list[dict] = []
+    skipped: list[str] = []
+    for key, value in data.items():
+        if key in _NON_BUDGET_KEYS or not isinstance(value, dict):
+            continue
+        utilization = value.get("utilization")
+        limit_dollars = value.get("limit_dollars")
+        if (
+            not _is_real_number(utilization)
+            or not _is_real_number(limit_dollars)
+            or limit_dollars <= 0
+        ):
+            skipped.append(key)
+            continue
+        # The code name must never reach a user — it rotates and tells them
+        # nothing — so each pool gets a positional label in API order and the
+        # raw key rides along for JSON and debugging only.
+        entry: dict = {
+            "key": key,
+            "name": "plan" if not budget else f"plan {len(budget) + 1}",
+            "pct": float(utilization),
+        }
+        if value.get("resets_at"):
+            entry["resets_at"] = value["resets_at"]
+            try:
+                entry["countdown"], entry["clock"] = format_reset(value["resets_at"])
+            except (TypeError, ValueError):
+                # This loop walks keys nobody has seen before, so an
+                # unparseable timestamp costs that one pool its clock strings
+                # (``fresh_reset_strings`` degrades the same way) rather than
+                # the whole account's usage row.
+                _logger.debug("Budget window %s has unparseable resets_at", key)
+        used_dollars = value.get("used_dollars")
+        if _is_real_number(used_dollars):
+            entry["used"] = float(used_dollars)
+        entry["limit"] = float(limit_dollars)
+        budget.append(entry)
+    if skipped:
+        # The discoverability valve for the next time these names rotate or the
+        # shape moves: a non-null pool object that stopped matching the rule
+        # above leaves no other trace. Null slots — the great majority — stay
+        # silent, because logging those would bury the one line worth reading.
+        _logger.debug(
+            "Usage API: non-null unhandled window keys not read as budgets: %s",
+            ", ".join(skipped),
+        )
+    if budget:
+        result["budget"] = budget
+
     return result if result else None
+
+
+def budget_windows(usage: dict | None) -> list[dict]:
+    """The parsed ``budget`` entries, or ``[]`` — never None.
+
+    Filtered to entries that are actually usable (dict, display ``name``,
+    numeric ``pct``) so every consumer — CLI rows, TUI, menubar, JSON — can
+    read ``name``/``pct`` without re-validating a row that a stale persisted
+    ``last_good`` might have carried in.
+    """
+    if not isinstance(usage, dict):
+        return []
+    windows = usage.get("budget")
+    if not isinstance(windows, list):
+        return []
+    return [
+        w
+        for w in windows
+        if isinstance(w, dict)
+        and isinstance(w.get("name"), str)
+        and _is_real_number(w.get("pct"))
+    ]
+
+
+def _usable_spend(usage: dict) -> dict | None:
+    """The normalized ``spend`` entry when it can bind a decision, else None."""
+    spend = usage.get("spend")
+    if isinstance(spend, dict) and _is_real_number(spend.get("pct")):
+        return spend
+    return None
+
+
+def has_rate_windows(usage: dict | None) -> bool:
+    """True when the account reports any rate-limit window at all.
+
+    That is ``five_hour``, ``seven_day``, or a non-empty ``scoped``.
+    Deliberately independent of the ``models`` filter: this asks what the
+    ACCOUNT has, not what the current config looks at. A Max account whose
+    config names no models still has rate windows, and calling it money-gated
+    because ``relevant_windows(usage)`` happens to skip its ``scoped`` list
+    would be exactly the wrong answer.
+    """
+    if not isinstance(usage, dict):
+        return False
+    for key in ("five_hour", "seven_day"):
+        window = usage.get(key)
+        if isinstance(window, dict) and _is_real_number(window.get("pct")):
+            return True
+    scoped = usage.get("scoped")
+    return isinstance(scoped, list) and any(
+        isinstance(s, dict)
+        and isinstance(s.get("name"), str)
+        and _is_real_number(s.get("pct"))
+        for s in scoped
+    )
+
+
+def is_budget_account(usage: dict | None) -> bool:
+    """True when the account is gated by a dollar budget rather than by windows.
+
+    An Enterprise plan reports no ``five_hour``/``seven_day``/``scoped`` at all
+    and a dollar budget instead (``spend`` and/or ``budget``); measured
+    2026-09-15. False when usage is unavailable or unknown — an account we
+    could not measure is not a budget account, and callers gating behaviour on
+    this must keep treating unknown as unknown.
+    """
+    if not isinstance(usage, dict) or has_rate_windows(usage):
+        return False
+    return bool(_usable_spend(usage) or budget_windows(usage))
 
 
 def relevant_windows(
@@ -547,11 +757,41 @@ def relevant_windows(
     canonical window source for decisions, scheduling, and reset math — so a
     window that binds a decision can never be invisible to the scheduler.
     ``spend`` (pay-as-you-go extra-usage credits) is a separate axis and is
-    deliberately excluded. ``resets_at`` is the ISO string as fetched, or
-    ``None`` when the API sent none.
+    deliberately excluded *for an account that has rate windows* — there,
+    credits keep working past a maxed 5h/7d window, so folding them in would
+    misreport headroom. ``resets_at`` is the ISO string as fetched, or ``None``
+    when the API sent none.
+
+    An account with no rate windows at all (:func:`has_rate_windows` False) is
+    gated by money instead, and returns its *binding* money pool: the ``$$``
+    credit pool when it has one, else its ``plan`` budget windows. Those labels
+    reach user-facing strings ("at $$ limit"), so they stay human-readable —
+    never the API's rotating code name.
     """
     if not isinstance(usage, dict):
         return []
+    if not has_rate_windows(usage):
+        # Measured 2026-09-15 on the Enterprise account: its plan pool
+        # ("cinder_cove") sat at 100% — $1000 of $1000, resetting three days
+        # out — while the account served requests normally and
+        # extra_usage.used_credits climbed 5839 -> 6123 over ten minutes. So an
+        # exhausted budget window does NOT block while credits remain: usage
+        # falls through the pools in order and the LAST one binds.
+        #
+        # Hence credits first, and deliberately no max() across the pools —
+        # taking the max would have called that account exhausted at 100% while
+        # it was happily working. A budget window only binds when there is no
+        # credit pool to fall through to. (On that org can_purchase_credits is
+        # false, so once the credits go there is no further fallback until the
+        # monthly reset.) Neither pool means genuinely unknown, which is
+        # today's behaviour and stays "never auto-skipped".
+        spend = _usable_spend(usage)
+        if spend is not None:
+            return [("$$", float(spend["pct"]), spend.get("resets_at"))]
+        return [
+            (w["name"], float(w["pct"]), w.get("resets_at"))
+            for w in budget_windows(usage)
+        ]
     windows: list[tuple[str, float, str | None]] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
@@ -584,9 +824,12 @@ def account_headroom(
     maxed at 100% blocks that model's work even with 5h/7d headroom, so for
     someone pinned to that model it binds just as hard. Returns the headroom
     of the *binding* window (``100 - max(pct)``), so ``<= 0`` means the
-    account is at or over a limit. Returns ``None`` when usage is unavailable
-    or carries no window data, which callers treat as "unknown" (never
-    auto-skipped).
+    account is at or over a limit. For a dollar-budget account (no rate windows
+    at all) the binding *money* pool stands in — see :func:`relevant_windows` —
+    so such an account finally reports real headroom instead of the "unknown"
+    that made ``cswap auto`` fail over off a perfectly healthy one. Returns
+    ``None`` when usage is unavailable or carries no window data at all, which
+    callers treat as "unknown" (never auto-skipped).
     """
     pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
     if not pcts:
