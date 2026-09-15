@@ -8,12 +8,13 @@ human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
 Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
-the candidate with the most headroom — proactively, so the old account is
-still valid while a running Claude Code picks the new one up (this is what
-makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
-``hysteresis_pct`` below the threshold so two accounts hovering at the line
-never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
+higher of its 5h/7d utilization — or, for a dollar-budget account reporting
+no rate windows at all, its binding money pool) crosses ``settings.threshold``,
+switch to the candidate with the most headroom — proactively, so the old
+account is still valid while a running Claude Code picks the new one up (this
+is what makes the macOS ~30s Keychain cache latency harmless). Candidates must
+sit ``hysteresis_pct`` below the threshold so two accounts hovering at the
+line never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
 (bypassed only when the active account is hard at its limit). Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
@@ -614,6 +615,55 @@ def _every_account_above_threshold(
     return all((100.0 - h) >= threshold for h in measured)
 
 
+def _eligible_oauth_candidates(
+    oauth_candidates: list[str],
+    usage: dict[str, dict | str | None],
+    headroom: dict[str, float | None],
+    mode: str,
+) -> list[str]:
+    """``oauth_candidates`` narrowed by ``autoswitch.budgetAccounts``.
+
+    A dollar-budget (Enterprise) account reports no rate windows at all, so it
+    used to have no measurable headroom and the engine could neither pick it
+    nor refuse it on merit. It can now — ``oauth.relevant_windows`` stands the
+    binding money pool in — and that is exactly what makes this knob
+    necessary, because the two percentages are not interchangeable: 30% of a
+    5-hour window is back in hours, 30% of a $200/month credit pool is back on
+    the first of the month, and on the org measured 2026-09-15
+    ``can_purchase_credits`` is ``false``, so nothing follows it.
+
+    ``rank`` returns the list untouched. ``exclude`` drops every budget
+    account. ``reserve`` drops them only while some ordinary candidate is
+    still usable — "usable" meaning measured AND with headroom left, because a
+    candidate whose usage is unreadable this tick cannot be chosen either (the
+    ranking loop skips ``None`` headroom outright), so holding the reserve
+    shut on its account would strand the engine on a burning active with
+    nowhere to go. Vacuously open when there are no ordinary candidates at
+    all, which is the right reading: a budget-only fleet must not be reserved
+    against itself.
+
+    Unknown usage is never classified as a budget account
+    (:func:`oauth.is_budget_account` is False for it, deliberately), so a
+    transient fetch failure can only leave a budget account IN the pool — it
+    can never silently drop an ordinary one that merely failed to fetch.
+    """
+    if mode == "rank":
+        return oauth_candidates
+    budget = set()
+    for num in oauth_candidates:
+        value = usage.get(num)
+        if oauth.is_budget_account(value if isinstance(value, dict) else None):
+            budget.add(num)
+    if not budget:
+        return oauth_candidates
+    ordinary = [n for n in oauth_candidates if n not in budget]
+    if mode == "reserve" and all(
+        (h := headroom.get(n)) is None or h <= 0 for n in ordinary
+    ):
+        return oauth_candidates
+    return ordinary
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -999,6 +1049,20 @@ class AutoSwitchEngine:
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
+            # "Unknown" here has to mean the usage could not be READ. Until
+            # 2026-09-15 it also swallowed a whole class of account that was
+            # perfectly readable and perfectly healthy: an Enterprise plan
+            # reports no 5h/7d/scoped windows at all, so `account_headroom`
+            # returned None for it, every tick landed here, and after
+            # `unhealthy_ticks` the `trigger = "failover"` below moved the user
+            # off an account sitting at 30% of its budget. Not hypothetical —
+            # the reporter's own autoswitch_state.json records the move, with
+            # `leftTrigger: "failover"` and `leftHeadroom: null` side by side,
+            # and `leftHeadroom: null` is the whole bug in one field.
+            # `relevant_windows` now stands the binding money pool in, so such
+            # an account takes the branch above on its real utilization.
+            # Nothing in this branch changed, and nothing in it should ever
+            # have to know what gates an account — that is the fix.
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
                 # contention, unattributable lineage, failed persist, or the
@@ -1056,9 +1120,18 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
-        oauth_candidates = [
+        all_oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        # `budgetAccounts` narrows the OAuth half the same way
+        # `includeApiKeyAccounts` gates the API-key half below: an eligibility
+        # census taken before ranking, not another clause inside it. Both knobs
+        # answer the same question — may automation spend this kind of money
+        # on its own? — so they answer it in the same place and the ranking
+        # stays about which account is best, not about what it is.
+        oauth_candidates = _eligible_oauth_candidates(
+            all_oauth_candidates, usage, headroom, settings.budget_accounts
+        )
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
@@ -1095,7 +1168,23 @@ class AutoSwitchEngine:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
-            self._emit(NoSwitchEvent(reason="no-candidates"))
+            self._emit(
+                NoSwitchEvent(
+                    reason="no-candidates",
+                    # Only `exclude` can empty the list this way: `reserve`
+                    # opens vacuously when there is no ordinary candidate to
+                    # reserve against. Without this the config looks like a
+                    # missing account, which is the one thing the user would
+                    # go and "fix" by adding one.
+                    detail=(
+                        "every candidate is a dollar-budget account and "
+                        "autoswitch.budgetAccounts is "
+                        f"'{settings.budget_accounts}'"
+                        if all_oauth_candidates
+                        else ""
+                    ),
+                )
+            )
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
@@ -1204,6 +1293,14 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
+            # Re-taken on the fresh snapshot, like everything else here. The
+            # `reserve` gate reads candidate headroom, and phase 2 is where
+            # candidate headroom changes — deciding eligibility once from the
+            # stale snapshot would open (or hold shut) the reserve on data the
+            # switch is not actually being made on.
+            oauth_candidates = _eligible_oauth_candidates(
+                all_oauth_candidates, usage, headroom, settings.budget_accounts
+            )
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
@@ -2213,12 +2310,30 @@ class AutoSwitchEngine:
         self._model_check_done = True
         missing = [name for low, name in wanted.items() if low not in seen]
         if missing:
+            # The tail has to be true of the fleet that is actually there, and
+            # on one fleet it was not. A dollar-budget account reports no
+            # 5h/7d windows either (measured 2026-09-15) — it is gated by
+            # money — so where every readable account is money-gated, "only
+            # the 5h/7d limits are being watched" named two limits that do not
+            # exist and sent the reader looking for a typo that is not the
+            # problem: no spelling of a model name can match there, because
+            # such an account carries no per-model limits at all. A MIXED
+            # fleet keeps the original tail, which is exactly right for it —
+            # the rate-window accounts are where a misspelling would bite.
+            # The substance is unchanged either way: the filter is inert.
+            tail = (
+                "only the 5h/7d limits are being watched for it (typo?)"
+                if any(oauth.has_rate_windows(v) for v in readable)
+                else (
+                    "every account is gated by a dollar budget, which reports "
+                    "no per-model limits — the setting has nothing to match"
+                )
+            )
             self._emit(
                 ConfigWarningEvent(
                     message=(
                         f"autoswitch.model: {', '.join(missing)} matches no "
-                        "account's usage windows — only the 5h/7d limits are "
-                        "being watched for it (typo?)"
+                        f"account's usage windows — {tail}"
                     )
                 )
             )

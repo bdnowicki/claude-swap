@@ -6894,3 +6894,476 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+# --- dollar-budget (Enterprise) accounts ---------------------------------------
+#
+# Fixtures below are the NORMALIZED shape `oauth.build_usage_result` produces
+# from the live capture taken 2026-09-15: no `five_hour`, no `seven_day`, no
+# `scoped` at all, one `spend` credit pool and one `budget` plan pool.
+# `test_budget_shape_matches_the_capture` pins the fixture against the real
+# parser so these tests cannot quietly drift onto an invented shape.
+
+_BUDGET_PLAN_RESET = "2026-09-18T02:10:41.779260+00:00"
+
+
+def _budget_usage(credits_pct: float, plan_pct: float = 100.0) -> dict:
+    """A money-gated account: a `$$` credit pool and one spent plan pool.
+
+    `plan_pct` defaults to 100.0 because that is what the capture showed — the
+    plan's $1000 was gone while the account went on serving requests off its
+    credits — and it is the state most likely to be mishandled. The `$$` entry
+    carries NO `resets_at`: the API sent none, which is why every reset-ranking
+    path below has to degrade rather than rank on `None`.
+    """
+    return {
+        "spend": {
+            "used": round(200.0 * credits_pct / 100.0, 2),
+            "limit": 200.0,
+            "pct": credits_pct,
+            "currency": "USD",
+        },
+        "budget": [{
+            "key": "cinder_cove",
+            "name": "plan",
+            "pct": plan_pct,
+            "resets_at": _BUDGET_PLAN_RESET,
+            "used": 1000.0 * plan_pct / 100.0,
+            "limit": 1000.0,
+        }],
+    }
+
+
+class TestBudgetAccountFixture:
+    def test_budget_shape_matches_the_capture(self):
+        """The fixture is worth nothing unless it is the shape the parser
+        really emits. Rebuild the 2026-09-15 capture through
+        `build_usage_result` and compare the keys decisions read."""
+        raw = {
+            "five_hour": None, "seven_day": None,
+            "nimbus_quill": {
+                "utilization": 0.0, "resets_at": None, "limit_dollars": None,
+                "used_dollars": None, "remaining_dollars": None,
+                "locked_reason": None,
+            },
+            "cinder_cove": {
+                "utilization": 100.0, "resets_at": _BUDGET_PLAN_RESET,
+                "limit_dollars": 1000, "used_dollars": 1000.0,
+                "remaining_dollars": 0.0, "locked_reason": None,
+            },
+            "extra_usage": {
+                "is_enabled": True, "monthly_limit": 20000,
+                "used_credits": 6123.0, "utilization": 30.615,
+                "currency": "USD", "decimal_places": 2,
+            },
+            "limits": [],
+            "spend": {
+                "used": {"amount_minor": 6123, "currency": "USD", "exponent": 2},
+                "limit": {"amount_minor": 20000, "currency": "USD", "exponent": 2},
+                "percent": 31, "can_purchase_credits": False,
+            },
+            "member_dashboard_available": True, "seven_day_breakdown": None,
+        }
+        parsed = oauth.build_usage_result(raw)
+        fixture = _budget_usage(30.615)
+        assert parsed["spend"] == fixture["spend"]
+        assert [(b["name"], b["pct"]) for b in parsed["budget"]] == [
+            (b["name"], b["pct"]) for b in fixture["budget"]
+        ]
+        assert "five_hour" not in parsed and "seven_day" not in parsed
+        assert "scoped" not in parsed
+        # The premise every test below rests on.
+        assert oauth.is_budget_account(fixture) is True
+        assert oauth.account_headroom(fixture) == pytest.approx(69.385)
+
+    def test_the_binding_window_carries_no_reset(self):
+        """Not a bug — the API sends none for the credit pool. Pin it
+        explicitly rather than leaving it an incidental property of the
+        fixture, because three ranking paths below depend on it."""
+        assert oauth.relevant_windows(_budget_usage(30.615)) == [
+            ("$$", 30.615, None)
+        ]
+
+
+class TestBudgetAccountIsNotUnhealthy:
+    """THE regression this whole change exists for.
+
+    `cswap auto` counted an unhealthy tick whenever `active_headroom is None`
+    and, after `unhealthy_ticks` of them, set `trigger = "failover"`. A
+    money-gated account had no measurable headroom, so it landed there every
+    single tick and got failed over off a perfectly healthy account. Not
+    hypothetical: the reporter's own `autoswitch_state.json` recorded the move,
+    with `lastSwitchFrom: 4`, `leftTrigger: "failover"` and `leftHeadroom:
+    null` side by side.
+    """
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_healthy_budget_active_holds_instead_of_failing_over(
+        self, temp_home
+    ):
+        # Four ticks, because the bug needed `unhealthy_ticks` (3) of them: a
+        # single tick looked fine even before the fix, reporting
+        # "active-usage-unknown 1/3" and holding.
+        h = self._harness(temp_home)
+        assert h.settings.unhealthy_ticks == 3, "premise: failover took 3 ticks"
+        usage = {"1": _budget_usage(30.615), "2": _usage(0)}
+        for _ in range(4):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+
+        assert h.active_number() == 1, (
+            "the engine failed over off a healthy money-gated account — the "
+            "exact move recorded in the reporter's autoswitch_state.json"
+        )
+        assert not [e for e in h.events if isinstance(e, SwitchEvent)]
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"] * 4, (
+            f"expected a plain below-threshold hold every tick, got {reasons}"
+        )
+        assert next(
+            e.detail for e in h.events if isinstance(e, NoSwitchEvent)
+        ) == "30.615% < 90%"
+        assert h.engine._unhealthy_ticks == 0
+
+    def test_poll_event_reports_the_money_pool_as_the_binding_window(
+        self, temp_home
+    ):
+        """`leftHeadroom: null` in the state file came from a headroom map with
+        no entry to give. The poll event is where the user — and the JSONL
+        consumers — see that it now has one."""
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": _budget_usage(30.615), "2": _usage(0)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.headroom["1"] == pytest.approx(69.385)
+        assert poll.windows["1"] == {"$$": 30.615}
+
+    def test_spent_credits_are_at_limit_not_failover(self, temp_home):
+        """The other half of the same bug: headroom stayed `None` when the
+        budget was genuinely gone, so the engine could never call it at-limit
+        either. It must now move, and label the move honestly."""
+        h = self._harness(temp_home)
+        assert h.tick_with_usage(
+            {"1": _budget_usage(100.0), "2": _usage(0)}
+        ) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", (
+            f"expected at-limit, got {sw.trigger!r} — 'failover' would mean "
+            "the engine still cannot tell 'spent' from 'unreadable'"
+        )
+
+    def test_at_limit_with_no_reset_does_not_oversleep(self, temp_home):
+        """A spent budget account is blocked with no `resets_at` anywhere, so
+        the moment it becomes usable again is unprovable. `_earliest_recovery`
+        must refuse to answer rather than sleep toward some other account's
+        known reset."""
+        h = self._harness(temp_home)
+        assert h.engine._earliest_recovery({"1": _budget_usage(100.0)}) is None
+
+    def test_unreadable_usage_still_fails_over(self, temp_home):
+        """The branch is still load-bearing for what it was written for. The
+        fix narrowed what reaches it; it must not have disarmed it."""
+        h = self._harness(temp_home)
+        unreadable = {"1": None, "2": _usage(0)}
+        assert h.tick_with_usage(unreadable) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(unreadable) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(unreadable) is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+
+class TestBudgetAccountsSettingDrivesSelection:
+    """`autoswitch.budgetAccounts` as a target filter.
+
+    The fleet is the same in every mode: an active account over the threshold
+    that must move, one ordinary peer with room, and one budget peer with MORE
+    room — so `rank` and the other two modes pick different accounts, and the
+    knob is provably doing the choosing rather than agreeing by accident.
+    """
+
+    def _harness(self, temp_home: Path, mode: str) -> EngineHarness:
+        h = EngineHarness(temp_home, budget_accounts=mode)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _fleet(self, ordinary_peer_pct: float) -> dict:
+        return {
+            "1": _usage(95),                  # active, over the threshold
+            "2": _usage(ordinary_peer_pct),   # ordinary peer
+            "3": _budget_usage(10.0),         # budget peer, 90 points
+        }
+
+    def test_rank_lets_the_budget_account_win_on_headroom(self, temp_home):
+        h = self._harness(temp_home, "rank")
+        assert h.settings.budget_accounts == "rank", "premise: rank is default"
+        assert h.tick_with_usage(self._fleet(50)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "rank must compare a budget account on headroom like any other — "
+            "90 points beats 50"
+        )
+
+    def test_reserve_prefers_a_usable_ordinary_peer(self, temp_home):
+        h = self._harness(temp_home, "reserve")
+        assert h.tick_with_usage(self._fleet(50)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            "reserve must spend the refillable 5h/7d quota first, even though "
+            "the budget account offers 40 more points"
+        )
+
+    def test_reserve_opens_once_every_ordinary_peer_is_exhausted(
+        self, temp_home
+    ):
+        h = self._harness(temp_home, "reserve")
+        assert h.tick_with_usage(self._fleet(100)) is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "reserve is a deferral, not an exclusion — with the ordinary peer "
+            "at its limit the budget account is the only place left to work"
+        )
+
+    def test_reserve_opens_when_the_ordinary_peer_is_unreadable(
+        self, temp_home
+    ):
+        """An unreadable candidate is skipped by the ranking loop outright, so
+        it can never be chosen. Holding the reserve shut on its account would
+        strand the engine on a burning active with nowhere to go."""
+        h = self._harness(temp_home, "reserve")
+        fleet = self._fleet(50)
+        fleet["2"] = None
+        assert h.tick_with_usage(fleet) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_exclude_never_targets_the_budget_account(self, temp_home):
+        h = self._harness(temp_home, "exclude")
+        assert h.tick_with_usage(self._fleet(50)) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_exclude_holds_even_when_it_is_the_only_account_left(
+        self, temp_home
+    ):
+        """`exclude` is unconditional — that is exactly the difference from
+        `reserve`. With the ordinary peer exhausted the engine reports
+        all-exhausted rather than quietly spending the budget."""
+        h = self._harness(temp_home, "exclude")
+        assert h.tick_with_usage(self._fleet(100)) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        assert [e.kind for e in h.events if isinstance(e, AllExhaustedEvent)] == [
+            "all-exhausted"
+        ]
+
+    def test_exclude_says_why_when_it_empties_the_candidate_list(
+        self, temp_home
+    ):
+        """A bare "no-candidates" reads as a missing account, which is the one
+        thing a user would go and "fix" by adding one."""
+        h = EngineHarness(temp_home, budget_accounts="exclude")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _budget_usage(10.0)})
+        assert outcome is TickOutcome.BLOCKED
+        ev = next(
+            e
+            for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "no-candidates"
+        )
+        assert "budgetAccounts" in ev.detail and "exclude" in ev.detail
+
+    @pytest.mark.parametrize("mode", ["rank", "reserve", "exclude"])
+    def test_the_knob_is_inert_on_a_fleet_with_no_budget_accounts(
+        self, temp_home, mode
+    ):
+        """It must not touch anyone who does not have such an account — down
+        to the `no-candidates` detail, which stays empty."""
+        h = EngineHarness(temp_home, budget_accounts=mode)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage(
+            {"1": _usage(95), "2": _usage(50), "3": _usage(10)}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_the_active_budget_account_is_never_self_excluded(self, temp_home):
+        """The knob governs TARGETS. An `exclude` user sitting on a budget
+        account must still have it watched — otherwise the setting would
+        silently re-create the failover bug it was added alongside."""
+        h = EngineHarness(temp_home, budget_accounts="exclude")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _budget_usage(30.615), "2": _usage(0)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ] == ["below-threshold"]
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.headroom["1"] == pytest.approx(69.385)
+
+
+class TestBudgetAccountsUnderConsumeFirst:
+    """`consume-first` ranks by soonest WEEKLY reset. A money-gated account has
+    no `resets_at` on its binding window at all (measured 2026-09-15), so every
+    reset comparison here has to degrade rather than rank on `None`."""
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_budget_active_holds_and_names_the_unknown_reset(self, temp_home):
+        """Not a crash and not a switch: with no weekly window of its own the
+        active account cannot prove anyone else's quota is more perishable, so
+        consume-first is idle — and says so, instead of looking enabled while
+        doing nothing."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _budget_usage(30.615),
+            "2": _usage7(10, 10, _R_SOON),
+            "3": _usage7(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [
+            e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+        ] == ["reset-unknown"]
+
+    def test_a_budget_candidate_is_skipped_for_a_sooner_weekly_reset(
+        self, temp_home
+    ):
+        """The budget peer holds 95 points against the window peer's 70 and
+        would win under `best`. Under consume-first it has no perishable weekly
+        quota to consume at all, so it must not displace the account that
+        does."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(30, 30, _R_SOON),
+            "3": _budget_usage(5.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_reserve_does_not_disturb_the_two_phase_commit(self, temp_home):
+        """consume-first re-decides on a phase-2 refetch, and eligibility is
+        re-taken there on the fresh snapshot. The budget peer is out of the
+        running on both passes for the same reason (no weekly reset), so the
+        re-take must leave the decision exactly where pass one put it."""
+        h = self._harness(temp_home, budget_accounts="reserve")
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(30, 30, _R_SOON),
+            "3": _budget_usage(5.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_with_nothing_below_the_threshold_it_ranks_on_the_other_axis(
+        self, temp_home
+    ):
+        """The all-above escape ranks by soonest RECOVERY, and a budget
+        account's binding pool reports no reset — `_binding_recovery_ts`
+        returns `inf` for it, meaning "cannot be scheduled around", so a peer
+        that provably comes back wins. That is the degradation, and it is the
+        right one: the credits return on the first of the month, not inside the
+        session."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _budget_usage(97.0),                    # 3 pts, no reset at all
+            "2": _usage(90, _iso_at(h.clock.now + 3600)),  # 10 pts, back in 1h
+            "3": _usage(95),                             # 5 pts, no reset
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+
+class TestBudgetAccountAndModelNameCheck:
+    """`_check_model_names` unions every account's `scoped` window names. A
+    budget account reports none, so it can only ever fail to ADD one — it must
+    not be able to turn a satisfied check into a warning."""
+
+    _WITH_SCOPED = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 10.0},
+        "scoped": [{"name": "Fable", "pct": 5.0}],
+    }
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_budget_peer_does_not_trigger_a_false_warning(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": self._WITH_SCOPED, "2": _budget_usage(10.0)})
+        assert not [e for e in h.events if isinstance(e, ConfigWarningEvent)], (
+            "a budget account contributes no scoped names, but it must not "
+            "subtract the ones another account reports"
+        )
+        assert h.engine._model_check_done is True
+
+    def test_a_budget_active_does_not_trigger_it_either(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": _budget_usage(10.0), "2": self._WITH_SCOPED})
+        assert not [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert h.engine._model_check_done is True
+
+    def test_an_all_money_gated_fleet_gets_a_tail_that_is_true_of_it(
+        self, temp_home
+    ):
+        """The warning is right that the filter is inert, but its remedy used
+        to name two limits a money-gated fleet does not have: "only the 5h/7d
+        limits are being watched for it (typo?)". There are no 5h/7d limits
+        there, and no spelling of a model name would help — such an account
+        carries no per-model limits at all, so the reader was sent hunting a
+        typo that was never the problem."""
+        h = self._harness(temp_home)
+        h.tick_with_usage({"1": _budget_usage(10.0), "2": _budget_usage(20.0)})
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        message = warnings[0].message
+        assert "Fable" in message and "matches no account's usage windows" in (
+            message
+        ), "the substance must survive: the filter still gates nothing"
+        assert "5h/7d" not in message, (
+            f"the tail claims limits this fleet does not have: {message!r}"
+        )
+        assert "typo" not in message, (
+            "no spelling matches on a money-gated fleet, so the typo hint "
+            f"sends the reader after the wrong thing: {message!r}"
+        )
+        assert "dollar budget" in message
+
+    def test_a_mixed_fleet_keeps_the_original_5h_7d_tail(self, temp_home):
+        """The other half, and the reason the tail is conditional rather than
+        reworded outright: with a rate-window account in the fleet a
+        misspelling really would bite there, and the original advice is
+        exactly right."""
+        h = self._harness(temp_home)
+        without_the_name = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Opus", "pct": 5.0}],
+        }
+        h.tick_with_usage({"1": without_the_name, "2": _budget_usage(10.0)})
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "only the 5h/7d limits are being watched for it (typo?)" in (
+            warnings[0].message
+        )

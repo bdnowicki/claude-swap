@@ -99,6 +99,57 @@ class TestLoadSettings:
         assert load_settings(tmp_path).strategy == "consume-first"
 
 
+class TestBudgetAccountsSetting:
+    """``autoswitch.budgetAccounts`` — how ``cswap auto`` may spend a
+    dollar-budget (Enterprise) account's monthly pool.
+
+    Defaults to ``rank`` rather than to the cautious end, unlike
+    ``includeApiKeyAccounts``: a budget account is already in the user's
+    rotation and, since 2026-09-15, reports real headroom, so ranking it is
+    what the engine was always trying to do. The other two modes exist because
+    a percentage off a monthly pool is not the same good as a percentage off a
+    5-hour window — see the ``AutoSwitchSettings`` docstring.
+    """
+
+    def test_defaults_to_rank(self, tmp_path: Path):
+        assert AutoSwitchSettings().budget_accounts == "rank"
+        assert load_settings(tmp_path).budget_accounts == "rank"
+
+    @pytest.mark.parametrize("mode", ["rank", "reserve", "exclude"])
+    def test_every_mode_round_trips_through_set_setting(
+        self, tmp_path: Path, mode: str
+    ):
+        assert set_setting(tmp_path, "autoswitch.budgetAccounts", mode) == mode
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["autoswitch"]["budgetAccounts"] == mode
+        assert load_settings(tmp_path).budget_accounts == mode
+
+    def test_unsupported_value_clamps_to_rank_on_load(self, tmp_path: Path):
+        """The forgiving-load half: a hand-edited settings.json must degrade
+        to the default, never crash `cswap auto`."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"budgetAccounts": "hoard"}})
+        )
+        assert load_settings(tmp_path).budget_accounts == "rank"
+
+    def test_non_string_value_clamps_to_rank_on_load(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"budgetAccounts": 1}})
+        )
+        assert load_settings(tmp_path).budget_accounts == "rank"
+
+    def test_set_rejects_unsupported_value_strictly(self, tmp_path: Path):
+        """The strict-set half: the user learns at `config set` time, not by
+        silently degraded behavior at `cswap auto` time."""
+        with pytest.raises(ConfigError, match="rank, reserve, exclude"):
+            set_setting(tmp_path, "autoswitch.budgetAccounts", "hoard")
+        assert not settings_path(tmp_path).exists()
+
+    def test_save_load_round_trip_carries_the_mode(self, tmp_path: Path):
+        save_settings(tmp_path, AutoSwitchSettings(budget_accounts="reserve"))
+        assert load_settings(tmp_path).budget_accounts == "reserve"
+
+
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):
         custom = AutoSwitchSettings(threshold=85.0, cooldown_seconds=60.0)
