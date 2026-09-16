@@ -100,15 +100,48 @@ def _scoped_window_to_json(entry: dict, fetched_at: float | None) -> dict:
     return out
 
 
+def _budget_window_to_json(entry: dict) -> dict:
+    """Project one dollar-budget pool, carrying its label and its amounts.
+
+    No pace fields: pace projects a weekly rate window forward against its
+    reset, and a budget pool has no such cadence (the captured credit pool
+    reports no ``resets_at`` at all, measured 2026-09-15).
+
+    The API's raw key for the pool (``cinder_cove`` and friends) is
+    deliberately *not* emitted. It is a rotating server-side code name, so a
+    script keying on it would break silently whenever it rotated — and it
+    would read as stable for weeks first. ``name`` ("plan", "plan 2", …) is
+    the positional label every surface already uses and is the identifier
+    scripts should join on.
+    """
+    out = _window_to_json(entry)
+    out["name"] = entry["name"]
+    # Defensive ``in`` checks rather than direct indexing: ``budget_windows``
+    # guarantees only a usable name and pct, and these rows can arrive from a
+    # persisted last-good measurement written by an older version.
+    for key in ("used", "limit"):
+        if key in entry:
+            out[key] = entry[key]
+    return out
+
+
 def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     """Convert the internal usage dict to its camelCase JSON projection.
 
     Sub-keys are emitted only when present in the source (the API does not always
     return every window or pay-as-you-go spend). ``fetched_at`` is the
     measurement's fetch time; passing it adds pace fields to the weekly
-    windows (``seven_day``, ``scoped``) only — never ``five_hour`` (issue #125).
+    windows (``seven_day``, ``scoped``) only — never ``five_hour`` (issue #125)
+    and never a dollar pool. A dollar-budget (Enterprise) account reports no
+    window keys at all, so its projection is ``budget`` plus ``spend``.
     """
     out: dict = {}
+    # Budget pools lead, mirroring the consumption order every display surface
+    # uses (plan dollars first, then credits). Absent on a window-based
+    # account, so its projection is unchanged.
+    budget = oauth.budget_windows(usage)
+    if budget:
+        out["budget"] = [_budget_window_to_json(w) for w in budget]
     if "five_hour" in usage:
         out["fiveHour"] = _window_to_json(usage["five_hour"])
     if "seven_day" in usage:

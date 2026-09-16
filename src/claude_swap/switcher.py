@@ -122,20 +122,76 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
     return "  (ahead of pace)" if result and result.ahead else ""
 
 
+def _money_cell(window: dict) -> str:
+    """"  $61.23 / $200.00" for a dollar pool, or "" when the figures are absent.
+
+    ``used_dollars`` is nullable in the API while ``limit_dollars`` is what
+    makes a pool a pool, so a budget window can arrive carrying only its cap.
+    The percentage already says how full it is; inventing the missing half of
+    the fraction (or printing "$? / $1,000.00") would say less, not more.
+    """
+    used, limit = window.get("used"), window.get("limit")
+    if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
+        return f"  ${used:,.2f} / ${limit:,.2f}"
+    return ""
+
+
 def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
     rows: list[tuple[str, str]] = []
+    # Whether money is what gates this ACCOUNT — one answer for every money
+    # row, not one per pool. ``(!)`` says "this is what stops you", so an
+    # unconditional marker would be this display contradicting the decision
+    # layer: ``oauth.relevant_windows`` deliberately excludes ``spend`` for an
+    # account that has rate windows, because credits there keep working past a
+    # maxed 5h/7d window, so flagging the one row the engine is documented to
+    # refuse to let bind is crying wolf. On a money-gated account that same
+    # pool genuinely is what binds — and with ``can_purchase_credits: false``
+    # on the captured org, the end of the line — so there it is earned.
+    # (Reasoning from the TUI side; ``tui.widgets.usage_rows`` gates the same
+    # way off the same helper, and the two surfaces must agree.)
+    #
+    # Note this is the account's property, NOT "is this pool in
+    # ``relevant_windows``": that test returns only ``$$`` once credits exist,
+    # so it would strip the marker off a budget account's spent ``plan`` row.
+    money_gated = oauth.is_budget_account(usage)
+    # Dollar pools lead, in the order they are actually spent: the plan's
+    # included budget first, then the extra-usage credits it falls through to
+    # once that is gone. Measured 2026-09-15 on the Enterprise account — its
+    # plan pool read 100% ($1000/$1000, resetting three days out) while
+    # extra_usage.used_credits kept climbing and requests kept working, so a
+    # maxed plan pool is a step in the chain rather than the end of it, and
+    # reading the rows top-to-bottom follows the money.
+    for w in oauth.budget_windows(usage):
+        # Same at/over-limit flag ``scoped`` uses. Deliberately never a pace
+        # marker: pace measures burn against a weekly window's elapsed
+        # fraction, and a plan budget is neither weekly nor rate-limited.
+        marker = "  (!)" if money_gated and w["pct"] >= 100 else ""
+        money = _money_cell(w)
+        cell = oauth.fresh_reset_strings(w)
+        if cell:
+            countdown, clock = cell
+            rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}{money}"))
+        else:
+            rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}{money}"))
     spend = usage.get("spend")
     if spend:
         used = spend["used"]
         limit = spend["limit"]
         pct = spend["pct"]
+        # Credits are the last pool in the chain, so a maxed one genuinely is
+        # the end of the road for a budget account — the same flag a maxed
+        # model gets. Gated on ``money_gated`` for the reason above.
+        marker = "  (!)" if money_gated and pct >= 100 else ""
+        # No reset row is the common case here: the captured Enterprise credit
+        # pool sends no resets_at at all, which is the API's real answer rather
+        # than a parse failure.
         cell = oauth.fresh_reset_strings(spend)
         if cell:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
+            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}{marker}  ${used:,.2f} / ${limit:,.2f}"))
         else:
-            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+            rows.append(("$$", f"{pct:>3.0f}%{marker}   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).
@@ -5289,18 +5345,33 @@ class ClaudeAccountSwitcher:
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
-        Compares the rate-limit headroom of every *other* switchable account
+        Compares the remaining headroom of every *other* switchable account
         against the current one and only recommends a switch it can *prove*
         lands on strictly more headroom — never onto an account worse than (or
         merely unverifiable against) where the user already is. When a switch
         can't be proven beneficial, it stays put; bare ``cswap --switch``
         remains the way to force a plain rotation. ``models`` folds the named
         per-model weekly windows into every headroom comparison (see
-        ``oauth.account_headroom``). Returns ``(target, note)``:
+        ``oauth.account_headroom``).
+
+        Headroom is a percentage, not a unit, so accounts gated by different
+        things compare directly: a dollar-budget (Enterprise) account
+        contributes the headroom of its binding *money* pool, and ``models``
+        simply does not apply to it — it reports no per-model windows. Until
+        ``oauth.relevant_windows`` learned that pool, such an account measured
+        as ``None`` and landed in ``current-unavailable`` below, so ``best``
+        refused to move off it however spent it was.
+
+        This path deliberately ignores the ``autoswitch.budgetAccounts``
+        setting: that knob governs automation, and ``cswap switch --strategy``
+        is an explicit user action.
+
+        Returns ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
-        - ``(None, "current-unavailable")`` — current account's usage is unknown,
-          so no comparison is possible → stay
+        - ``(None, "current-unavailable")`` — current account's usage is unknown
+          (unreadable, or carrying no window *or* budget data at all), so no
+          comparison is possible → stay
         - ``(None, "no-comparison")`` — no other account has known usage → stay
         - ``(None, "incomplete-comparison")`` — current is best among the
           accounts we can measure, but some candidate's usage is unknown, so we
@@ -5329,6 +5400,11 @@ class ClaudeAccountSwitcher:
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
             # better. Stay rather than risk moving onto a worse account.
+            #
+            # A healthy dollar-budget account used to land here: it reports no
+            # 5h/7d window, so headroom was "unknown" and `best` was pinned to
+            # it. Its money pool now answers, so only a genuinely unreadable
+            # (or window-less *and* budget-less) account reaches this.
             return None, "current-unavailable"
 
         scored = [
@@ -5425,10 +5501,13 @@ class ClaudeAccountSwitcher:
         windows carry a non-null ``resets_at`` are compared (two idle
         accounts at 0% with nothing scheduled are indistinguishable, never
         flagged; API-key slots have sentinel usage and never reach the
-        comparison). Known benign false-positive source until PR #119 lands:
-        a session profile that drifted to another account makes its slot
-        report that account's usage — same lockstep signature, different
-        cause.
+        comparison). A dollar-budget account reports no 5h/7d windows at all
+        (measured 2026-09-15), so it is likewise never compared and never
+        flagged — one fewer signal there, but no false alarm either, which is
+        the side to err on for a warning this loud. Known benign
+        false-positive source until PR #119 lands: a session profile that
+        drifted to another account makes its slot report that account's
+        usage — same lockstep signature, different cause.
         """
         seen: dict[tuple, str] = {}
         out: list[str] = []
@@ -5815,14 +5894,19 @@ class ClaudeAccountSwitcher:
 
         Args:
             strategy: Usage-aware target selection. ``"best"`` jumps to the
-                  switchable account with the most remaining 5h/7d quota instead
+                  switchable account with the most remaining quota instead
                   of advancing the rotation; ``"next-available"`` rotates to the
-                  next account, skipping any currently at its 5h/7d limit. ``None``
-                  (the default) performs a plain rotation.
+                  next account, skipping any currently at its limit. ``None``
+                  (the default) performs a plain rotation. "Quota" is the 5h/7d
+                  windows for an ordinary account and the binding dollar pool
+                  for a budget (Enterprise) one — ``oauth.relevant_windows``
+                  decides which, per account.
             models: Per-model weekly windows folded into every usage
                   comparison of the usage-aware strategies (parsed display
                   names, or the ``all`` sentinel — see
-                  ``oauth.relevant_windows``). Empty = 5h/7d only.
+                  ``oauth.relevant_windows``). Empty = 5h/7d only; a budget
+                  account reports no per-model windows, so this never
+                  applies to one either way.
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
@@ -6035,8 +6119,19 @@ class ClaudeAccountSwitcher:
                 )
                 return None
             if note == "exhausted":
-                # With model limits in play the binding window may be scoped.
-                limits_label = "usage limits" if models else "5h/7d limit"
+                # With model limits in play the binding window may be scoped,
+                # and a dollar-budget account has no 5h/7d window to be at in
+                # the first place (measured 2026-09-15: five_hour and
+                # seven_day both null). Either way, naming "5h/7d" would name
+                # a limit that is not what stopped anyone.
+                limits_label = (
+                    "usage limits"
+                    if models or any(
+                        isinstance(u, dict) and not oauth.has_rate_windows(u)
+                        for u in best_usage.values()
+                    )
+                    else "5h/7d limit"
+                )
                 if json_output:
                     return self._switch_noop(
                         strategy=strategy_label, reason="candidates-exhausted",
@@ -6100,17 +6195,25 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate), models)
+                candidate_usage = usage.get(candidate)
+                headroom = oauth.account_headroom(candidate_usage, models)
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
                     label = "5h/7d"
-                    if models:
-                        # Name what actually binds ("Fable", "5h/Fable", ...)
-                        # so a config-driven skip is never mysterious.
+                    if models or not oauth.has_rate_windows(candidate_usage):
+                        # Name what actually binds ("Fable", "5h/Fable", "$$",
+                        # "plan") so a skip is never mysterious. The default
+                        # above is only honest for an account that HAS 5h/7d
+                        # windows: a dollar-budget one reports neither
+                        # (measured 2026-09-15), so it would have been skipped
+                        # for being "at its 5h/7d limit" — a window it does not
+                        # possess. ``headroom <= 0`` means some window is at
+                        # 100%, so this list is never empty in practice; the
+                        # guard keeps the old label if that ever stops holding.
                         at = [
                             name
                             for name, pct, _ in oauth.relevant_windows(
-                                usage.get(candidate), models
+                                candidate_usage, models
                             )
                             if pct >= 100.0
                         ]
@@ -6130,8 +6233,18 @@ class ClaudeAccountSwitcher:
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
-            # one (the per-skip lines name it), so don't claim "5h/7d".
-            limits_label = "usage limits" if models else "5h/7d limit"
+            # one (the per-skip lines name it), so don't claim "5h/7d". A
+            # dollar-budget account has no such window at all, so the same
+            # applies whenever one of the accounts we gave up on was
+            # money-gated.
+            limits_label = (
+                "usage limits"
+                if models or any(
+                    not oauth.has_rate_windows(usage.get(num))
+                    for num in skipped_exhausted
+                )
+                else "5h/7d limit"
+            )
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",

@@ -46,12 +46,13 @@ class TestConfigList:
             "autoswitch.hysteresisPct",
             "autoswitch.strategy",
             "autoswitch.includeApiKeyAccounts",
+            "autoswitch.budgetAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 10
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,10 +79,11 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 10
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
+        assert by_key["autoswitch.budgetAccounts"]["value"] == "rank"
 
 
 class TestConfigSetGet:
@@ -100,6 +102,21 @@ class TestConfigSetGet:
         assert set(raw) == {"schemaVersion", "autoswitch"}
         assert set(raw["autoswitch"]) == {"threshold"}
         assert raw["autoswitch"]["threshold"] == 80.0
+
+    def test_budget_accounts_round_trips_through_the_cli(self, temp_home, capsys):
+        """The knob a user actually reaches for, end to end: `config set`
+        writes only that key, `config get` reads it back, and the auto engine
+        is handed the parsed value."""
+        code, out, _ = _run(
+            ["set", "autoswitch.budgetAccounts", "reserve"], capsys
+        )
+        assert code == 0
+        assert "autoswitch.budgetAccounts = reserve" in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert set(raw["autoswitch"]) == {"budgetAccounts"}
+        code, out, _ = _run(["get", "autoswitch.budgetAccounts"], capsys)
+        assert code == 0
+        assert out.strip() == "reserve"
 
     def test_set_bool_words(self, temp_home, capsys):
         code, out, _ = _run(
@@ -175,6 +192,13 @@ class TestConfigValidation:
         code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
         assert code == 1
         assert "must be one of: best" in err
+
+    def test_bad_budget_accounts_exits_1_and_lists_the_modes(
+        self, temp_home, capsys
+    ):
+        code, _, err = _run(["set", "autoswitch.budgetAccounts", "hoard"], capsys)
+        assert code == 1
+        assert "must be one of: rank, reserve, exclude" in err
 
     def test_unknown_key_json_error_envelope(self, temp_home, capsys):
         code, out, _ = _run(["--json", "get", "autoswitch.bogus"], capsys)
@@ -268,3 +292,28 @@ class TestConfigMisc:
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+    def test_auto_picks_up_configured_budget_accounts(self, temp_home, capsys):
+        """The knob is inert unless it reaches the engine's settings object —
+        `cswap auto` has no `--budget-accounts` flag, so settings.json is the
+        only path it can travel."""
+        _run(["set", "autoswitch.budgetAccounts", "exclude"], capsys)
+
+        captured = {}
+
+        class FakeEngine:
+            def __init__(self, switcher, settings, on_event, *, dry_run=False,
+                         state_path=None, clock=None):
+                captured["settings"] = settings
+
+            def tick(self):
+                from claude_swap.autoswitch import TickOutcome
+
+                return TickOutcome.NO_ACTION
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert captured["settings"].budget_accounts == "exclude"

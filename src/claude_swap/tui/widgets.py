@@ -16,7 +16,7 @@ from textual import events
 from textual.message import Message
 from textual.widgets import ListItem, ListView, Static
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES
@@ -110,6 +110,72 @@ def _pace_suffix(window: dict, fetched_at: float | None) -> str:
     return "(ahead of pace)" if result and result.ahead else ""
 
 
+def _money_suffixes(
+    window: dict, amounts: str, now: float, *, money_gated: bool
+) -> tuple[str, str]:
+    """``(suffix, suffix_full)`` for a dollar row: reset, ``(!)``, amounts.
+
+    The maxed marker sits *between* the countdown and the amounts rather than
+    trailing the row, so it lands in the same place here as in the CLI's
+    ``_format_usage_lines``. Either of the countdown and the amounts can be
+    absent (a credit pool reports no ``resets_at`` at all — measured
+    2026-09-15 on the Enterprise account), so the parts are joined by what is
+    actually present rather than by a fixed template.
+
+    ``money_gated`` is whether money is what gates this *account*, and it is
+    what decides the marker. Without it, a Max account whose credits reached
+    100% would be marked on the one row ``oauth.relevant_windows`` is
+    documented to refuse to let bind — credits there keep serving past a maxed
+    5h/7d window — and the display would be contradicting the decision layer.
+
+    Deliberately the account's property, not "is this pool in
+    ``relevant_windows``": that test returns only ``$$`` when credits exist,
+    so it would strip the marker from a budget account's exhausted ``plan``
+    row, which §5 requires and which is a genuinely spent pool even though
+    usage falls through past it.
+    """
+    reset, reset_full = _reset_parts(window, now)
+    marker = "(!)" if money_gated and float(window["pct"]) >= 100 else ""
+    return (
+        "  ".join(part for part in (reset or "", marker, amounts) if part),
+        "  ".join(part for part in (reset_full or "", marker, amounts) if part),
+    )
+
+
+def _dollar_amounts(window: dict) -> str:
+    """``"$61.23 / $200.00"`` for a money pool, or ``""`` when not both known.
+
+    A budget window's ``used`` is omitted when the API sent ``used_dollars:
+    null``. Rather than invent a one-sided money format for a case the
+    2026-09-15 captures never produced (every pool with a ``limit_dollars``
+    also carried a ``used_dollars``), such a row simply shows its bar and pct.
+    """
+    used, limit = window.get("used"), window.get("limit")
+    if isinstance(used, (int, float)) and isinstance(limit, (int, float)):
+        return f"${used:,.2f} / ${limit:,.2f}"
+    return ""
+
+
+def _money_pools(last_good: dict | None) -> list[tuple[str, dict]]:
+    """``[(label, window)]`` for a money-gated account, in consumption order.
+
+    Budget pools under their display names, then the credit pool as ``$$`` —
+    the same order :func:`usage_rows` lays out. Empty for an account that has
+    rate-limit windows, which is the whole point: this feeds the compressed
+    "how close to blocked" surfaces, and for a window account credits are a
+    separate axis that keeps serving past a maxed 5h/7d window.
+    """
+    if not isinstance(last_good, dict) or not oauth.is_budget_account(last_good):
+        return []
+    pools: list[tuple[str, dict]] = [
+        (w["name"], w) for w in oauth.budget_windows(last_good)
+    ]
+    spend = last_good.get("spend")
+    if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+        pools.append(("$$", spend))
+    return pools
+
+
 def usage_rows(
     last_good: dict | None, now: float, fetched_at: float | None = None
 ) -> list[tuple[str, float, str, str]]:
@@ -119,21 +185,44 @@ def usage_rows(
     ``suffix_full`` extends the reset countdown with the absolute clock time
     (``resets 2h 13m · 20:39``) for rows that have room; otherwise it equals
     ``suffix``. Only windows the account actually has produce a row — an
-    annual plan without a 7-day window simply has no 7d line. Order matches
-    the CLI: spend, 5h, 7d, then per-model scoped windows (e.g. "Fable"),
-    the latter marked ``(!)`` at/over their limit. The weekly (7d) and scoped
-    rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
-    week's expected usage (issue #125) — never the 5h row.
+    annual plan without a 7-day window simply has no 7d line.
+
+    Order matches the CLI's: dollar-budget pools ("plan", "plan 2", …), then
+    spend ("$$"), then 5h, 7d, then per-model scoped windows (e.g. "Fable").
+    That is the order the pools are actually consumed — an Enterprise plan
+    spends its included budget and then falls through to credits (measured
+    2026-09-15) — so reading top to bottom follows the money.
+
+    ``(!)`` marks a row at/over its limit: the scoped ones always, and the
+    money rows (budget and ``$$``) only on an account that money actually
+    gates — see :func:`_money_suffixes` for why a Max account's exhausted
+    credits are not marked. The weekly (7d) and scoped rows also carry a
+    "(ahead of pace)" marker when meaningfully ahead of the week's expected
+    usage (issue #125) — never the 5h row, and never a money row, which has
+    no weekly cadence to be ahead of.
     """
     if not isinstance(last_good, dict):
         return []
     rows: list[tuple[str, float, str, str]] = []
+    # One answer for the whole money row, not one per pool: an exhausted
+    # dollar pool is a real limit on an account that money gates, and merely a
+    # spent overflow axis on one that rate windows gate (see _money_suffixes).
+    money_gated = oauth.is_budget_account(last_good)
+    # Budget pools first: the plan's included dollars are spent before any
+    # credit pool is touched. ``oauth.budget_windows`` has already dropped
+    # rows a stale persisted ``last_good`` could carry in without a usable
+    # name/pct, so nothing here needs re-validating.
+    for window in oauth.budget_windows(last_good):
+        suffix, suffix_full = _money_suffixes(
+            window, _dollar_amounts(window), now, money_gated=money_gated
+        )
+        rows.append((window["name"], float(window["pct"]), suffix, suffix_full))
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
-        reset, reset_full = _reset_parts(spend, now)
-        suffix = f"{reset}  {amounts}" if reset else amounts
-        suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
+        suffix, suffix_full = _money_suffixes(
+            spend, amounts, now, money_gated=money_gated
+        )
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
@@ -251,6 +340,13 @@ def mini_account_text(
     colored; a window at/over 100% brings its reset countdown along, and a
     maxed per-model window shows as ``Fable (!)``. Sentinel states show
     their label instead.
+
+    A dollar-budget account has no 5h/7d windows at all, so it shows its money
+    pools (``plan 100% (!) · $$ 31%``) in their place — without that it read
+    "usage unknown" while the card above it showed real, measurable usage.
+    Only for such an account: where an account *does* have rate windows,
+    credits are a separate axis that keeps working past a maxed 5h/7d window,
+    so they do not belong in a line that answers "how close to blocked".
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
@@ -274,6 +370,23 @@ def mini_account_text(
     fetched_at = acc.usage.fetched_at
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0
+    # Same grammar as the window segments below — muted label, severity pct,
+    # countdown once maxed — in the card's pool order (budgets, then credits).
+    # ``_money_pools`` is empty for any account that has a rate window, so this
+    # and the 5h/7d loop are mutually exclusive.
+    for label, window in _money_pools(last_good):
+        pct = float(window["pct"])
+        if parts:
+            text.append(" · ", style=palette.track)
+        color = palette.severity(pct)
+        text.append(f"{label} ", style=palette.muted)
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        if pct >= 100:
+            text.append(" (!)", style=palette.sev_crit)
+            reset = data.reset_text(window, now)
+            if reset:
+                text.append(f" ({reset})", style=palette.muted)
+        parts += 1
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key) if isinstance(last_good, dict) else None
         if not window:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import sys
@@ -5632,11 +5633,126 @@ class TestSwitchSkipsBrokenSlots:
             s.switch()
 
 
+# --- 2026-09-15 usage-API captures -----------------------------------------
+# Two live accounts, trimmed to the keys that matter, kept verbatim. Fixtures
+# run these through oauth.build_usage_result instead of hand-writing the
+# normalized shape, so a test can never quietly agree with a normalizer that
+# drifted away from what the API actually sends.
+
+# Account 4 — Enterprise. No rate windows at all; gated by a $1000 plan pool
+# under a rotating code name plus a $200/month credit pool. The plan pool reads
+# 100% while credits keep climbing and requests keep working: an exhausted
+# budget window does not block, usage falls through to the next pool.
+# "nimbus_quill" is the trap — non-null, utilization 0.0, every dollar field
+# null, and present on ordinary accounts too. It must produce nothing anywhere.
+_ENTERPRISE_CAPTURE = {
+    "five_hour": None,
+    "seven_day": None,
+    "seven_day_opus": None,
+    "seven_day_sonnet": None,
+    "nimbus_quill": {
+        "utilization": 0.0, "resets_at": None,
+        "limit_dollars": None, "used_dollars": None,
+        "remaining_dollars": None, "locked_reason": None,
+    },
+    "cinder_cove": {
+        "utilization": 100.0,
+        "resets_at": "2026-09-18T02:10:41.779260+00:00",
+        "limit_dollars": 1000, "used_dollars": 1000.0,
+        "remaining_dollars": 0.0, "locked_reason": None,
+    },
+    "copper_kite": None, "harbor_lantern": None, "amber_ladder": None,
+    "juniper_tide": None, "cedar_ember": None,
+    "extra_usage": {
+        "is_enabled": True, "monthly_limit": 20000, "used_credits": 6123.0,
+        "utilization": 30.615, "currency": "USD", "decimal_places": 2,
+        "disabled_reason": None, "user_disabled": False,
+        "spend_limit_reached": False, "credits_ever_enabled": True,
+        "daily": None, "weekly": None,
+    },
+    "limits": [],
+    "spend": {
+        "used": {"amount_minor": 6123, "currency": "USD", "exponent": 2},
+        "limit": {"amount_minor": 20000, "currency": "USD", "exponent": 2},
+        "percent": 31, "severity": "normal", "enabled": True,
+        "disabled_reason": None,
+        "cap": {"money": None, "credits": {"amount_minor": 20000, "exponent": 2}},
+        "balance": None, "auto_reload": None,
+        "can_purchase_credits": False, "can_toggle": False,
+    },
+    "member_dashboard_available": True,
+    "seven_day_breakdown": None,
+}
+
+# Account 1 — ordinary window-based account, the regression baseline. Note
+# extra_usage.monthly_limit and spend.limit.amount_minor are both 0: "no credit
+# pool", never "a $0 pool, therefore spent".
+_WINDOW_CAPTURE = {
+    "five_hour": {"utilization": 0.0, "resets_at": None,
+                  "limit_dollars": None, "used_dollars": None,
+                  "remaining_dollars": None, "locked_reason": None},
+    "seven_day": {"utilization": 0.0, "resets_at": "2026-09-21T16:00:00+00:00",
+                  "limit_dollars": None, "used_dollars": None,
+                  "remaining_dollars": None, "locked_reason": None},
+    "nimbus_quill": {"utilization": 0.0, "resets_at": None,
+                     "limit_dollars": None, "used_dollars": None,
+                     "remaining_dollars": None, "locked_reason": None},
+    "cinder_cove": None,
+    "extra_usage": {"is_enabled": True, "monthly_limit": 0, "used_credits": 0.0,
+                    "utilization": None, "currency": "USD"},
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 0,
+         "resets_at": None, "scope": None, "is_active": True},
+        {"kind": "weekly_all", "group": "weekly", "percent": 0,
+         "resets_at": "2026-09-21T16:00:00+00:00", "scope": None,
+         "is_active": False},
+    ],
+    "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+              "limit": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+              "percent": 0, "severity": "normal", "enabled": True,
+              "cap": {"money": None,
+                      "credits": {"amount_minor": 0, "exponent": 2}}},
+    "member_dashboard_available": False,
+}
+
+
+def _enterprise_usage(
+    credits_pct: float = 30.615,
+    plan_pct: float = 100.0,
+    credits: bool = True,
+) -> dict:
+    """Normalized usage for the Enterprise capture, percentages overridable.
+
+    ``credits=False`` is the same org with its credit pool switched off, so
+    nothing falls through past the plan pool and the plan pool binds instead.
+    """
+    raw = copy.deepcopy(_ENTERPRISE_CAPTURE)
+    raw["cinder_cove"]["utilization"] = plan_pct
+    if credits:
+        raw["extra_usage"]["utilization"] = credits_pct
+    else:
+        raw["extra_usage"]["is_enabled"] = False
+        raw["spend"]["limit"] = {
+            "amount_minor": 0, "currency": "USD", "exponent": 2,
+        }
+    usage = oauth.build_usage_result(raw)
+    assert usage is not None
+    return usage
+
+
+def _window_account_usage() -> dict:
+    """Normalized usage for the ordinary window-based capture."""
+    usage = oauth.build_usage_result(copy.deepcopy(_WINDOW_CAPTURE))
+    assert usage is not None
+    return usage
+
+
 class TestUsageAwareSwitch:
-    """--switch --strategy best / next-available pick targets by remaining 5h/7d
-    quota. `best` only switches when another account is provably better and
-    otherwise stays put; `next-available` rotates, skipping accounts at their
-    limit (and anchors on the live account)."""
+    """--switch --strategy best / next-available pick targets by remaining
+    quota — 5h/7d for an ordinary account, the binding dollar pool for a
+    budget (Enterprise) one. `best` only switches when another account is
+    provably better and otherwise stays put; `next-available` rotates,
+    skipping accounts at their limit (and anchors on the live account)."""
 
     def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
         s = ClaudeAccountSwitcher()
@@ -6032,6 +6148,207 @@ class TestUsageAwareSwitch:
 
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
         assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    # -- dollar-budget (Enterprise) accounts -------------------------------
+
+    def test_best_from_a_budget_account_is_no_longer_current_unavailable(
+        self, temp_home: Path
+    ):
+        """The headline regression. A budget account reports no 5h/7d window,
+        so its headroom read None, so `best` hit `current-unavailable` and
+        refused to move off it however spent it was. Its credit pool now
+        answers — 69.385% left on the 2026-09-15 capture — so the comparison
+        actually runs."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        usage = {"1": _enterprise_usage(), "2": self._usage(10)}
+        target, note = s._select_best_switchable("1", usage=usage)
+
+        assert note != "current-unavailable"
+        assert (target, note) == ("2", "")  # 90% beats the budget account's 69.385%
+
+    def test_best_stays_on_a_budget_account_holding_the_most_headroom(
+        self, temp_home: Path
+    ):
+        """Headroom is a percentage, so the two kinds of account compare
+        directly: 69.385% of a credit pool beats 40% of a 5h window."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        usage = {"1": _enterprise_usage(), "2": self._usage(60)}
+        assert s._select_best_switchable("1", usage=usage) == (None, "stay")
+
+    def test_maxed_plan_pool_does_not_make_a_budget_account_look_exhausted(
+        self, temp_home: Path
+    ):
+        """Measured 2026-09-15: the plan pool read 100% ($1000/$1000) while the
+        account served requests normally and credits climbed 5839 -> 6123 over
+        ten minutes. Folding the pools together with max() would have declared
+        a healthy account dead and rotated the user off it."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        usage = {"1": _enterprise_usage(plan_pct=100.0), "2": self._usage(100)}
+        assert s._select_best_switchable("1", usage=usage) == (None, "stay")
+
+    def test_best_switches_off_a_budget_account_at_its_credit_limit(
+        self, temp_home: Path
+    ):
+        """Credits are the last pool in the chain, so 100% there really is the
+        end of the road — unlike the plan pool at 100%, which still serves."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": _enterprise_usage(credits_pct=100.0), "2": self._usage(50)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_next_available_skips_a_budget_account_at_its_credit_limit(
+        self, temp_home: Path, capsys
+    ):
+        """Never skipped before: the skip needs a measurable headroom and a
+        budget account had none. The message must name what actually binds —
+        the account has no 5h/7d limit to be "at"."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(0),
+            "2": _enterprise_usage(credits_pct=100.0),
+            "3": self._usage(20),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (at $$ limit)" in out
+        assert "5h/7d" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_next_available_keeps_a_budget_account_with_credits_left(
+        self, temp_home: Path, capsys
+    ):
+        """31% of the credit pool spent — the capture exactly as taken — is a
+        healthy account, even with the plan pool beside it reading 100%."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": _enterprise_usage(), "3": self._usage(0)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        assert "Skipping" not in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_next_available_skip_names_the_plan_pool_when_credits_are_off(
+        self, temp_home: Path, capsys
+    ):
+        """With no credit pool to fall through to, the plan pool is what binds
+        — and it is named by its display label, never by the API's rotating
+        code name, which means nothing to anyone reading the line."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(0),
+            "2": _enterprise_usage(credits=False),
+            "3": self._usage(20),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (at plan limit)" in out
+        assert "cinder_cove" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_next_available_exhausted_message_drops_the_5h_7d_claim(
+        self, temp_home: Path, capsys
+    ):
+        """The summary line lied the same way the per-skip line did: every
+        candidate here is money-gated, so "5h/7d limit" names a window none of
+        them has."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(0),
+            "2": _enterprise_usage(credits_pct=100.0),
+            "3": _enterprise_usage(credits_pct=100.0),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "All other accounts are at their usage limits" in out
+        assert "5h/7d" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_best_exhausted_message_drops_the_5h_7d_claim_for_budget_accounts(
+        self, temp_home: Path, capsys
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": _enterprise_usage(credits_pct=100.0),
+            "2": _enterprise_usage(credits_pct=100.0),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="best")
+
+        out = capsys.readouterr().out
+        assert "All accounts are at their usage limits" in out
+        assert "5h/7d" not in out
+        mock_list.assert_not_called()
+
+    def test_window_accounts_keep_saying_5h_7d(self, temp_home: Path, capsys):
+        """The generic wording is reserved for accounts that earn it: with no
+        budget account in play both messages must read exactly as before."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(100), "2": self._usage(100)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+        assert "All other accounts are at their 5h/7d limit" in capsys.readouterr().out
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best")
+        assert "All accounts are at their 5h/7d limit" in capsys.readouterr().out
 
 
 class TestClaudeCodeLockCooperation:
@@ -6759,6 +7076,181 @@ class TestFormatUsageLines:
         usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
         line = _format_usage_lines(usage, now)[0]
         assert "pace" not in line
+
+    # -- dollar-budget (Enterprise) rows -----------------------------------
+
+    def test_budget_rows_lead_and_flag_the_maxed_pool(self):
+        """The 2026-09-15 Enterprise capture, rendered. Pools come out in the
+        order they are spent, and the maxed plan pool carries the same flag a
+        maxed model gets.
+
+        Also pins the near-miss gate: this account HAS credits, so
+        ``oauth.relevant_windows`` returns only ``$$`` for it. Deciding the
+        marker by membership in that list would leave the spent ``plan`` row
+        unflagged — the marker is gated on the account being money-gated, not
+        on the pool being the one that currently binds.
+        """
+        assert oauth.relevant_windows(_enterprise_usage()) == [
+            ("$$", 30.615, None)
+        ]
+        lines = _format_usage_lines(_enterprise_usage())
+
+        assert len(lines) == 2
+        assert lines[0].startswith("plan:")
+        assert lines[1].startswith("$$:")
+        assert "100%" in lines[0] and "(!)" in lines[0]
+        assert "$1,000.00 / $1,000.00" in lines[0]
+        # Credits are the pool still working, so no flag on that row.
+        assert "31%" in lines[1] and "(!)" not in lines[1]
+        assert "$61.23 / $200.00" in lines[1]
+        # The API's rotating code names mean nothing to a user and must never
+        # reach one; nimbus_quill must produce no row at all.
+        assert "cinder_cove" not in "".join(lines)
+        assert "nimbus_quill" not in "".join(lines)
+
+    def test_budget_and_spend_layout_matches_the_documented_target(self):
+        """Byte-for-byte the target output in the design contract. Cached clock
+        strings (no resets_at) keep the countdown off the wall clock."""
+        usage = {
+            "budget": [{
+                "key": "cinder_cove", "name": "plan", "pct": 100.0,
+                "countdown": "2d 8h", "clock": "Sep 18 04:10",
+                "used": 1000.0, "limit": 1000.0,
+            }],
+            "spend": {
+                "used": 61.23, "limit": 200.0, "pct": 30.615, "currency": "USD",
+            },
+        }
+        assert _format_usage_lines(usage) == [
+            "plan: 100%   resets Sep 18 04:10  in 2d 8h  (!)  $1,000.00 / $1,000.00",
+            "$$:    31%   $61.23 / $200.00",
+        ]
+
+    def test_window_account_rows_unaffected_by_budget_support(self):
+        """The ordinary-account capture carries nimbus_quill (utilization 0.0,
+        every dollar field null) and a credit pool with monthly_limit 0.
+        Neither may produce a row — a zero limit is "no pool", not "spent"."""
+        lines = _format_usage_lines(_window_account_usage())
+
+        assert len(lines) == 2
+        assert lines[0].startswith("5h:")
+        assert lines[1].startswith("7d:")
+        assert "$" not in "".join(lines)
+
+    def test_full_row_order_is_budget_then_spend_then_windows(self):
+        usage = {
+            "five_hour": {"pct": 1.0},
+            "seven_day": {"pct": 2.0},
+            "scoped": [{"name": "Fable", "pct": 3.0}],
+            "spend": {"used": 1.0, "limit": 10.0, "pct": 10.0, "currency": "USD"},
+            "budget": [
+                {"key": "cinder_cove", "name": "plan", "pct": 4.0,
+                 "used": 40.0, "limit": 1000.0},
+                {"key": "amber_ladder", "name": "plan 2", "pct": 5.0,
+                 "used": 25.0, "limit": 500.0},
+            ],
+        }
+        labels = [line.split(":")[0] for line in _format_usage_lines(usage)]
+        assert labels == ["plan", "plan 2", "$$", "5h", "7d", "Fable"]
+
+    def test_budget_and_spend_rows_never_show_a_pace_marker(self):
+        """Pace measures burn against a weekly window's elapsed fraction, so a
+        monthly dollar pool has nothing to be ahead of — even on the exact
+        numbers that make a 7d row fire (issue #125)."""
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = (
+            datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        ).isoformat()
+        usage = {
+            "budget": [{"key": "k", "name": "plan", "pct": 50.0,
+                        "resets_at": resets_at, "used": 500.0, "limit": 1000.0}],
+            "spend": {"used": 5.0, "limit": 10.0, "pct": 50.0,
+                      "currency": "USD", "resets_at": resets_at},
+        }
+        assert "pace" not in "".join(_format_usage_lines(usage, now))
+        # The control: identical numbers on a 7d window do fire it.
+        seven = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        assert "(ahead of pace)" in _format_usage_lines(seven, now)[0]
+
+    def test_budget_reset_recomputed_from_resets_at(self):
+        # Same staleness trap the other rows have: a countdown frozen at fetch
+        # time overstates the wait by however long the measurement has aged.
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = (
+            datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)
+        ).isoformat()
+        usage = {"budget": [{
+            "key": "k", "name": "plan", "pct": 10.0, "resets_at": resets_at,
+            "clock": "stale-clock", "countdown": "17h 0m",
+            "used": 100.0, "limit": 1000.0,
+        }]}
+        line = _format_usage_lines(usage)[0]
+        assert "in 2h" in line
+        assert "stale-clock" not in line
+        assert "17h" not in line
+
+    def test_spend_at_limit_gets_the_marker_on_a_budget_account(self):
+        """Credits are the last pool in the chain, so a maxed one is the real
+        stop for a budget account — flagged like a maxed model."""
+        usage = {"spend": {"used": 200.0, "limit": 200.0, "pct": 100.0,
+                           "currency": "USD"}}
+        assert _format_usage_lines(usage) == ["$$: 100%  (!)   $200.00 / $200.00"]
+
+    def test_maxed_credits_are_not_marked_on_a_window_account(self):
+        """``(!)`` means "this is what stops you". On an account that rate
+        windows gate, credits keep serving past a maxed 5h/7d window — which
+        is why ``oauth.relevant_windows`` refuses to let spend bind there — so
+        marking them would have the display contradict the decision layer.
+        ``tui.widgets.usage_rows`` gates identically; the two must agree."""
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "spend": {"used": 200.0, "limit": 200.0, "pct": 100.0,
+                      "currency": "USD"},
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0] == "$$: 100%   $200.00 / $200.00"  # byte-identical to before
+        assert "(!)" not in "".join(lines)
+
+    def test_budget_row_without_dollar_figures_omits_the_money_cell(self):
+        """used_dollars is nullable in the API while limit_dollars is what makes
+        a pool a pool. The percentage already says how full it is, so the
+        missing half of the fraction is dropped rather than faked."""
+        usage = {"budget": [{"key": "k", "name": "plan", "pct": 40.0,
+                             "limit": 1000.0}]}
+        assert _format_usage_lines(usage) == ["plan:  40%"]
+
+    def test_budget_labels_align_columns_with_the_other_rows(self):
+        usage = {
+            "budget": [
+                {"key": "a", "name": "plan", "pct": 100.0,
+                 "used": 1000.0, "limit": 1000.0},
+                {"key": "b", "name": "plan 2", "pct": 5.0,
+                 "used": 25.0, "limit": 500.0},
+            ],
+            "spend": {"used": 61.23, "limit": 200.0, "pct": 30.615,
+                      "currency": "USD"},
+            "five_hour": {"pct": 7.0},
+        }
+        lines = _format_usage_lines(usage)
+        assert len({line.index("%") for line in lines}) == 1
+
+    def test_malformed_persisted_budget_row_is_skipped(self):
+        """last_good rows are replayed from the store, so one written by a
+        different version (or truncated) must cost itself a row, not the whole
+        account's usage display."""
+        usage = {
+            "budget": [
+                {"key": "k"},
+                {"key": "j", "name": "plan", "pct": 12.0,
+                 "used": 12.0, "limit": 100.0},
+            ],
+            "five_hour": {"pct": 1.0},
+        }
+        labels = [line.split(":")[0] for line in _format_usage_lines(usage)]
+        assert labels == ["plan", "5h"]
 
 
 def _read_safety_copy(switcher, entry_id: str) -> str:

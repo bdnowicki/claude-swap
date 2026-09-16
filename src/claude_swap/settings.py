@@ -41,6 +41,29 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
     ping-pong while a strictly better account is always taken.
+
+    ``budget_accounts`` decides whether a dollar-budget (Enterprise) account
+    may be an AUTOMATIC switch target. Such an account reports no 5h/7d/scoped
+    windows at all — it is gated by money — so until 2026-09-15 its headroom
+    read as "unknown" and the engine could neither choose it nor reject it on
+    merit. It can now (``oauth.relevant_windows`` stands the binding money
+    pool in), which raises the question this knob answers: the two
+    percentages are not the same good. 30% of a 5-hour window is back in
+    hours; 30% of a $200/month credit pool is back on the first of the month,
+    and on the org measured 2026-09-15 ``can_purchase_credits`` is ``false``,
+    so once those credits are gone there is no fallback at all until that
+    reset. ``rank`` (the default) lets it compete on headroom like any other
+    account, which is what the engine has always intended and can finally do.
+    ``reserve`` makes it eligible only once every non-budget candidate is
+    exhausted or unreadable. ``exclude`` keeps it out of automation entirely.
+    Same shape, and the same reason, as ``include_api_key_accounts``: money
+    that does not come back on a timer deserves to be spent deliberately.
+
+    The knob governs ``cswap auto`` ONLY. ``cswap switch --strategy best`` and
+    ``--strategy next-available`` deliberately ignore it, as does an explicit
+    ``cswap switch N`` — those are a user acting, not automation acting, and
+    someone who types a switch command has already decided to spend the
+    budget.
     """
 
     threshold: float = 90.0
@@ -49,6 +72,7 @@ class AutoSwitchSettings:
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
+    budget_accounts: str = "rank"  # "rank" | "reserve" | "exclude"; see above
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -126,6 +150,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "budgetAccounts", "budget_accounts", "choice",
+            choices=("rank", "reserve", "exclude"),
+            help="How cswap auto treats dollar-budget accounts as switch targets",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,

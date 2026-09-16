@@ -72,6 +72,43 @@ def make_entry(
     )
 
 
+def make_budget_entry(
+    *,
+    plan_pct: float = 100.0,
+    credits_pct: float = 30.615,
+    age_s: float = 5.0,
+) -> UsageEntry:
+    """The normalized usage of the Enterprise account captured 2026-09-15.
+
+    No 5h/7d/scoped window exists on it at all — the shape every window-keyed
+    display path used to fall straight through. What it has instead is an
+    included $1,000 plan pool (spent, resetting in ~2 days) and the $200
+    credit pool requests fall through to once that pool is gone.
+    """
+    return UsageEntry(
+        last_good={
+            "spend": {
+                "used": 61.23,
+                "limit": 200.0,
+                "pct": credits_pct,
+                "currency": "USD",
+            },
+            "budget": [
+                {
+                    "key": "cinder_cove",
+                    "name": "plan",
+                    "pct": plan_pct,
+                    "resets_at": _iso_in(86400 * 2 + 3600 * 8),
+                    "used": 1000.0,
+                    "limit": 1000.0,
+                }
+            ],
+        },
+        fetched_at=time.time() - age_s,
+        age_s=age_s,
+    )
+
+
 def make_account(
     number: int | str,
     *,
@@ -579,6 +616,104 @@ class TestUsageRows:
         assert rows[0][0] == "$$"
         assert "$12.50 / $50.00" in rows[0][2]
 
+    def test_budget_rows_lead_with_marker_then_amounts(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        rows = usage_rows(make_budget_entry().last_good, time.time())
+        # Budget pool first, credits second: the order they are consumed.
+        assert [label for label, *_ in rows] == ["plan", "$$"]
+        plan = rows[0]
+        assert plan[1] == 100.0
+        assert plan[2].startswith("resets ")
+        assert "$1,000.00 / $1,000.00" in plan[2]
+        # `(!)` sits between the countdown and the amounts, matching the CLI
+        assert plan[2].index("(!)") < plan[2].index("$1,000.00")
+        credits = rows[1]
+        assert "(!)" not in credits[2]  # 30.6% — nowhere near its limit
+        assert credits[2] == "$61.23 / $200.00"  # the credit pool sends no reset
+
+    def test_documented_row_order_holds_across_every_pool(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        # No real account reports all of these at once (an Enterprise plan has
+        # no rate windows and vice versa) — this pins the documented order the
+        # CLI's _format_usage_lines shares, so the two can't drift apart.
+        last_good = {
+            "five_hour": {"pct": 1.0},
+            "seven_day": {"pct": 2.0},
+            "scoped": [{"name": "Fable", "pct": 3.0}],
+            "spend": {"used": 1.0, "limit": 10.0, "pct": 4.0, "currency": "USD"},
+            "budget": [
+                {"name": "plan", "pct": 5.0, "used": 1.0, "limit": 10.0},
+                {"name": "plan 2", "pct": 6.0, "used": 1.0, "limit": 10.0},
+            ],
+        }
+        labels = [label for label, *_ in usage_rows(last_good, time.time())]
+        assert labels == ["plan", "plan 2", "$$", "5h", "7d", "Fable"]
+
+    def test_budget_row_never_shows_pace_marker(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        # 1 day into a 7-day span at 50% would read as "ahead of pace" for a
+        # weekly rate window. A dollar pool has no such cadence to be ahead of.
+        now = time.time()
+        last_good = {
+            "budget": [
+                {"name": "plan", "pct": 50.0, "resets_at": _iso_in(86400 * 6),
+                 "used": 500.0, "limit": 1000.0}
+            ]
+        }
+        row = usage_rows(last_good, now, now)[0]
+        assert "pace" not in row[2] and "pace" not in row[3]
+
+    def test_exhausted_pools_marked_on_budget_and_spend_rows(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        rows = usage_rows(
+            make_budget_entry(credits_pct=100.0).last_good, time.time()
+        )
+        assert [label for label, *_ in rows] == ["plan", "$$"]
+        assert all("(!)" in suffix for _l, _p, suffix, _f in rows)
+
+    def test_window_account_exhausted_credits_are_not_marked(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        # Credits at 100% on an account that rate windows gate. The marker
+        # would be this display contradicting the decision layer:
+        # oauth.relevant_windows deliberately refuses to let spend bind here,
+        # because credits keep serving past a maxed 5h/7d window.
+        entry = make_entry(
+            pct5=20.0,
+            spend={"used": 50.0, "limit": 50.0, "pct": 100.0, "currency": "USD"},
+        )
+        rows = usage_rows(entry.last_good, time.time())
+        spend_row = next(row for row in rows if row[0] == "$$")
+        assert spend_row[1] == 100.0
+        assert "(!)" not in spend_row[2] and "(!)" not in spend_row[3]
+        assert spend_row[2] == "$50.00 / $50.00"
+
+    def test_maxed_scoped_window_is_still_marked_on_a_window_account(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        # The money-row gate must not reach the scoped rows: a maxed model
+        # genuinely blocks that model's work.
+        entry = make_entry(
+            scoped=[("Fable", 100.0)],
+            spend={"used": 50.0, "limit": 50.0, "pct": 100.0, "currency": "USD"},
+        )
+        rows = usage_rows(entry.last_good, time.time())
+        assert "(!)" in next(row for row in rows if row[0] == "Fable")[2]
+        assert "(!)" not in next(row for row in rows if row[0] == "$$")[2]
+
+    def test_budget_row_without_used_amount_shows_no_money(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        # ``used_dollars: null`` with a real limit: no one-sided money string
+        # is invented, the bar and pct carry the row on their own.
+        last_good = {"budget": [{"name": "plan", "pct": 40.0, "limit": 1000.0}]}
+        row = usage_rows(last_good, time.time())[0]
+        assert row[2] == "" and row[3] == ""
+
     def test_suffix_full_extends_countdown_with_clock(self):
         from claude_swap.tui.widgets import usage_rows
 
@@ -720,6 +855,32 @@ class TestMiniAccountText:
         )
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
+
+    def test_budget_account_shows_money_instead_of_usage_unknown(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        acc = make_account(1, entry=make_budget_entry())
+        line = mini_account_text(acc, now).plain
+        assert "usage unknown" not in line
+        assert "plan 100% (!)" in line
+        assert "$$ 31%" in line
+        assert line.index("plan") < line.index("$$")  # consumption order
+
+    def test_window_account_mini_line_never_mentions_credits(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        # The compressed line answers "how close to blocked". For an account
+        # with rate windows, credits keep serving past a maxed 5h/7d, so they
+        # are not part of that answer — this line is unchanged.
+        now = time.time()
+        entry = make_entry(
+            pct5=92.0,
+            pct7=63.0,
+            spend={"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"},
+        )
+        line = mini_account_text(make_account(2, entry=entry), now).plain
+        assert line.endswith("5h 92% · 7d 63%")
 
 
 class TestRunAction:

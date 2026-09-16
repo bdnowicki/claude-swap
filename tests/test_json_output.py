@@ -100,6 +100,85 @@ class TestJsonHelpers:
         assert out["spend"]["countdown"] == countdown
         assert out["spend"]["clock"] == clock
 
+    def test_usage_to_json_emits_budget_pools(self):
+        # The Enterprise account captured 2026-09-15: no window keys at all,
+        # an exhausted $1,000 plan pool and the $200 credits it falls through
+        # to. The raw rotating API key ("cinder_cove") is deliberately not
+        # emitted — a script joining on it would break the day it rotated.
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=8)).isoformat()
+        countdown, clock = oauth.format_reset(resets_at)
+        usage = {
+            "spend": {"used": 61.23, "limit": 200.0, "pct": 30.615, "currency": "USD"},
+            "budget": [
+                {"key": "cinder_cove", "name": "plan", "pct": 100.0,
+                 "resets_at": resets_at, "countdown": countdown, "clock": clock,
+                 "used": 1000.0, "limit": 1000.0},
+            ],
+        }
+        out = usage_to_json(usage)
+        assert out["budget"] == [
+            {"pct": 100.0, "resetsAt": resets_at, "countdown": countdown,
+             "clock": clock, "name": "plan", "used": 1000.0, "limit": 1000.0},
+        ]
+        assert "key" not in out["budget"][0]
+        assert out["spend"]["pct"] == 30.615
+        assert "fiveHour" not in out and "sevenDay" not in out
+
+    def test_usage_to_json_recomputes_budget_reset_strings(self):
+        # Same reason as every other row: the store can serve a measurement
+        # hours after its fetch, so the cached strings are not to be trusted.
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        countdown, clock = oauth.format_reset(resets_at)
+        usage = {"budget": [{"key": "cinder_cove", "name": "plan", "pct": 100.0,
+                             "resets_at": resets_at, "countdown": "stale",
+                             "clock": "stale-clock", "used": 1.0, "limit": 2.0}]}
+        out = usage_to_json(usage)
+        assert out["budget"][0]["countdown"] == countdown
+        assert out["budget"][0]["clock"] == clock
+
+    def test_usage_to_json_budget_pool_without_reset_omits_strings(self):
+        # Measured 2026-09-15: the credit pool sends no resets_at at all, and a
+        # budget pool may not either. That is real data, not a parse failure.
+        usage = {"budget": [{"name": "plan", "pct": 12.0, "used": 1.0, "limit": 2.0}]}
+        out = usage_to_json(usage)
+        assert out["budget"] == [{"pct": 12.0, "name": "plan", "used": 1.0, "limit": 2.0}]
+
+    def test_usage_to_json_budget_pools_never_get_pace_fields(self):
+        # A dollar pool has no weekly cadence to run ahead of.
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"budget": [{"name": "plan", "pct": 50.0, "resets_at": resets_at,
+                             "used": 500.0, "limit": 1000.0}]}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["budget"][0]
+        assert "expectedPct" not in out["budget"][0]
+
+    def test_usage_to_json_drops_unusable_budget_rows(self):
+        # A row from a persisted last-good measurement that lost its name or
+        # pct must not reach JSON as a half-projected entry.
+        usage = {"budget": [{"key": "cinder_cove", "pct": 100.0},
+                            {"name": "plan", "pct": 100.0, "limit": 1000.0}]}
+        out = usage_to_json(usage)
+        assert [w["name"] for w in out["budget"]] == ["plan"]
+
+    def test_usage_to_json_window_account_gains_no_budget_key(self):
+        # The regression baseline (account 1 of the 2026-09-15 captures):
+        # projection unchanged, key for key.
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+        countdown, clock = oauth.format_reset(resets_at)
+        usage = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 0.0, "resets_at": resets_at},
+            "scoped": [{"name": "Fable", "pct": 0.0, "resets_at": resets_at}],
+        }
+        assert usage_to_json(usage) == {
+            "fiveHour": {"pct": 0.0},
+            "sevenDay": {"pct": 0.0, "resetsAt": resets_at,
+                         "countdown": countdown, "clock": clock},
+            "scoped": [{"pct": 0.0, "resetsAt": resets_at, "countdown": countdown,
+                        "clock": clock, "name": "Fable"}],
+        }
+
     def test_usage_to_json_adds_pace_fields_when_fetched_at_given(self):
         # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
         now = 1_700_000_000.0
