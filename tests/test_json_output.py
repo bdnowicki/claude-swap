@@ -105,7 +105,11 @@ class TestJsonHelpers:
         # an exhausted $1,000 plan pool and the $200 credits it falls through
         # to. The raw rotating API key ("cinder_cove") is deliberately not
         # emitted — a script joining on it would break the day it rotated.
-        resets_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=8)).isoformat()
+        # Off the unit boundary on purpose: format_reset truncates, and this
+        # countdown is computed twice (here, then again inside usage_to_json).
+        # Exactly on a boundary the two calls straddle it whenever the clock
+        # ticks in between — seen on Windows CI as "2d 8h" != "2d 7h".
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=2, hours=8, minutes=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {
             "spend": {"used": 61.23, "limit": 200.0, "pct": 30.615, "currency": "USD"},
@@ -127,7 +131,8 @@ class TestJsonHelpers:
     def test_usage_to_json_recomputes_budget_reset_strings(self):
         # Same reason as every other row: the store can serve a measurement
         # hours after its fetch, so the cached strings are not to be trusted.
-        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30)).isoformat()
+        # (+30s keeps it off a minute boundary; see the budget-pool test above.)
+        resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, minutes=30, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {"budget": [{"key": "cinder_cove", "name": "plan", "pct": 100.0,
                              "resets_at": resets_at, "countdown": "stale",
@@ -163,8 +168,9 @@ class TestJsonHelpers:
 
     def test_usage_to_json_window_account_gains_no_budget_key(self):
         # The regression baseline (account 1 of the 2026-09-15 captures):
-        # projection unchanged, key for key.
-        resets_at = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+        # projection unchanged, key for key. (+30min keeps it off an hour
+        # boundary; see the budget-pool test above.)
+        resets_at = (datetime.now(timezone.utc) + timedelta(days=6, minutes=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {
             "five_hour": {"pct": 0.0},
