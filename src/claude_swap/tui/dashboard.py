@@ -13,11 +13,12 @@ account-targeted opens a context of its own:
 - "Remove account", "Disable / enable account" and "Alias & name" nest into
   a submenu listing the accounts.
 
-On the account lists, wherever a cursor is live — always on the switch
-screen, once ``s`` has armed it on the watch screen — ``d`` disables or
-re-enables the highlighted account and ``a`` opens its alias & name form.
-Neither switches anything, and both stay put afterwards so several accounts
-can be edited in a row.
+On the account lists ``d`` disables or re-enables the highlighted account
+and ``a`` opens its alias & name form. The switch screen's cursor is always
+live, so they act at once; the watch screen has none while monitoring, so
+their first press there arms one (see :class:`WatchScreen`). Neither
+switches anything, and both stay put afterwards so several accounts can be
+edited in a row.
 
 ``o`` arms reorder mode on either list: ``-``/``+`` then move the selected
 account one place up or down (the accounts trade slot numbers, so their
@@ -51,6 +52,13 @@ FLASH_S = 1.5  # how long a just-refreshed row stays highlighted
 # The two per-account edits the lists offer on their cursor (`d`, `a`). Gated
 # together: wherever one is live, so is the other.
 _ACCOUNT_EDITS = frozenset({"toggle_disabled_highlighted", "edit_identity_highlighted"})
+
+# The watch screen's three Enter bindings, by the selection intent each serves.
+_ENTER_INTENTS = {
+    "select_highlighted": "switch",
+    "enter_toggle_disabled": "disable",
+    "enter_edit_identity": "identity",
+}
 
 MenuEntries = list[tuple[str, str]]  # (label, action_id)
 
@@ -518,24 +526,41 @@ class WatchScreen(AccountListScreen):
     deliberate gesture in a way Enter is not, which is the whole reason Enter
     is gated. Either way the screen returns to hands-off monitoring after.
 
-    Armed selection also offers ``d`` (disable / enable the highlighted
-    account) and ``a`` (its alias & name). Unlike Enter they leave selection
-    armed — editing one account is often the first of several — and Esc
-    still returns to monitoring.
+    ``d`` (disable / enable) and ``a`` (alias & name) are in the footer from
+    the start, so the monitor says they exist. Pressed while just watching,
+    either one only *arms* selection — cursor on the active account, the
+    title naming the action — and acts on nothing: a row a single click
+    happened to highlight is never the target of a key the user has not yet
+    aimed. Once armed, the same key or Enter acts on the highlighted account.
+    That is the selection's *intent*: ``s`` arms it for switching, ``d`` for
+    disable / enable, ``a`` for alias & name, and Enter does what the intent
+    says (the footer labels it accordingly). Whatever the intent, ``d`` and
+    ``a`` act on the highlighted account. Only a switch returns to
+    monitoring; a toggle or an edit leaves selection armed, since editing
+    one account is often the first of several. Esc disarms.
     """
 
     _WATCH_TITLE = "watching all accounts"
-    _SELECT_TITLE = (
-        "switch to which account? · enter switch · d disable/enable"
-        " · a alias & name · esc cancel"
-    )
+    _SELECT_TITLES = {
+        "switch": (
+            "switch to which account? · enter switch · d disable/enable"
+            " · a alias & name · esc cancel"
+        ),
+        "disable": "disable / enable which account? · d or enter toggle · esc cancel",
+        "identity": "alias & name for which account? · a or enter edit · esc cancel",
+    }
 
     BINDINGS = [
         Binding("s", "toggle_select", "Select"),
-        Binding("o", "toggle_order", "Reorder"),
-        Binding("enter", "select_highlighted", "Switch", priority=True),
         Binding("d", "toggle_disabled_highlighted", "Disable/enable"),
         Binding("a", "edit_identity_highlighted", "Alias & name"),
+        Binding("o", "toggle_order", "Reorder"),
+        # One Enter per intent. `check_action` leaves exactly one of them live,
+        # so the footer names what Enter will do and the key runs only that
+        # (Textual tries a key's bindings in order and skips disabled ones).
+        Binding("enter", "select_highlighted", "Switch", priority=True),
+        Binding("enter", "enter_toggle_disabled", "Toggle", priority=True),
+        Binding("enter", "enter_edit_identity", "Edit", priority=True),
         Binding("minus", "move(-1)", "Move up"),
         Binding("plus", "move(1)", "Move down"),
         Binding("f", "app.refresh_full", "Refresh", show=False),
@@ -547,6 +572,7 @@ class WatchScreen(AccountListScreen):
     def __init__(self) -> None:
         super().__init__()
         self._selecting = False
+        self._intent = "switch"  # what Enter does while selection is armed
 
     def on_mount(self) -> None:
         self.watch(self.app, "refresh_status", self._on_refresh_status)
@@ -555,7 +581,7 @@ class WatchScreen(AccountListScreen):
 
     def _title_text(self) -> str:
         if self._selecting:
-            return self._SELECT_TITLE
+            return self._SELECT_TITLES[self._intent]
         if self._ordering:
             return self._ORDER_TITLE
         status = self.app.refresh_status
@@ -569,10 +595,14 @@ class WatchScreen(AccountListScreen):
             self._render_title()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        if action == "select_highlighted" and not self._selecting:
-            return False  # Enter is inert until selection is armed
-        if action in _ACCOUNT_EDITS and not self._selecting:
-            return False  # so are d/a: monitor mode has no account to act on
+        enter_intent = _ENTER_INTENTS.get(action)
+        if enter_intent is not None:
+            # Enter is inert until selection is armed, and then means only
+            # what the selection was armed for.
+            if not self._selecting or self._intent != enter_intent:
+                return False
+        # d/a stay live in monitor mode (their first press arms selection);
+        # the base class still turns them off while reordering.
         return super().check_action(action, parameters)
 
     def _index_after_build(
@@ -586,12 +616,14 @@ class WatchScreen(AccountListScreen):
         """Reorder mode replaces selection: one cursor, one meaning for it."""
         if on:
             self._selecting = False
+            self._intent = "switch"
         super()._set_ordering(on)
         if not on:
             self._to_monitor()
 
-    def _set_selecting(self, on: bool) -> None:
+    def _set_selecting(self, on: bool, intent: str = "switch") -> None:
         self._selecting = on
+        self._intent = intent if on else "switch"
         if on:
             self._ordering = False
             listview = self.query_one("#accounts", ListView)
@@ -611,13 +643,52 @@ class WatchScreen(AccountListScreen):
         self._render_title()
 
     def action_toggle_select(self) -> None:
+        """``s`` arms selection for switching, or disarms it. Armed for
+        another intent, it re-aims at switching and keeps the cursor where it
+        is — the user is already pointing at the account they mean."""
+        if self._selecting and self._intent != "switch":
+            self._intent = "switch"
+            self._render_title()
+            self.refresh_bindings()
+            return
         self._set_selecting(not self._selecting)
 
+    def _arm(self, intent: str) -> bool:
+        """Arm selection for ``intent`` if it is not armed yet; True if this
+        press did the arming, so it must not also act."""
+        if self._selecting:
+            return False
+        self._set_selecting(True, intent)
+        return True
+
+    def action_toggle_disabled_highlighted(self) -> None:
+        if not self._arm("disable"):
+            super().action_toggle_disabled_highlighted()
+
+    def action_edit_identity_highlighted(self) -> None:
+        if not self._arm("identity"):
+            super().action_edit_identity_highlighted()
+
+    def action_enter_toggle_disabled(self) -> None:
+        super().action_toggle_disabled_highlighted()
+
+    def action_enter_edit_identity(self) -> None:
+        super().action_edit_identity_highlighted()
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """The ListView's own Enter. The screen's priority Enter bindings
+        normally get there first; this is the path when they do not, so it
+        follows the same intent rather than assuming a switch."""
         if not self._selecting:
             return  # Enter is inert until selection is armed
         item = event.item
-        if isinstance(item, AccountItem):
+        if not isinstance(item, AccountItem):
+            return
+        if self._intent == "disable":
+            self.app.do_toggle_disabled(item.number)
+        elif self._intent == "identity":
+            self.app.edit_identity(item.number)
+        else:
             self.app.do_switch(item.number)
             self._set_selecting(False)  # stay here, keep watching
 
@@ -632,7 +703,7 @@ class WatchScreen(AccountListScreen):
         self._set_selecting(False)
 
     def action_select_highlighted(self) -> None:
-        if self._selecting:
+        if self._selecting and self._intent == "switch":
             self.query_one("#accounts", ListView).action_select_cursor()
 
     def action_back(self) -> None:
