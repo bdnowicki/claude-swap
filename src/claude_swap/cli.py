@@ -15,6 +15,7 @@ from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
     ACCOUNT_THRESHOLD_MAX,
     ACCOUNT_THRESHOLD_MIN,
+    DISPLAY_NAME_MAX_LEN,
     Platform,
 )
 from claude_swap.printer import (
@@ -599,6 +600,87 @@ Examples:
         else:
             account_num, normalized = switcher.set_alias(args.account, args.alias_name)
             print(f"{accent('Set alias')} '{normalized}' for Account {account_num}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _name_command(argv: list[str]) -> None:
+    """Handle `cswap name [NUM|EMAIL|ALIAS] [TEXT...] [--unset]`.
+
+    The display-name sibling of `cswap alias`: with no arguments it lists the
+    names; otherwise it sets (or, with --unset, removes) one account's name.
+    TEXT may be several words — they are joined with single spaces — so
+    `cswap name 2 Luxoft main` needs no quotes. Pre-dispatched like `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap name",
+        description=(
+            "Set, remove, or list a free-form display name for an account. "
+            "It is shown in front of the alias in cswap list and the TUI "
+            "(\"Name · alias (email)\"), may contain spaces, and need not be "
+            "unique. Unlike an alias it never selects an account: switch, "
+            "remove, run and map still take a number, email or alias."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap name 2 "Luxoft – main"
+  cswap name dev Luxoft main          # several words: no quotes needed
+  cswap name 2 --unset
+  cswap name                          # list all names
+
+Up to {DISPLAY_NAME_MAX_LEN} characters; control characters are refused.
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL|ALIAS",
+        help="Account to name. Omit to list names.",
+    )
+    parser.add_argument(
+        "words",
+        nargs="*",
+        metavar="TEXT",
+        help="The name to set (one or more words).",
+    )
+    parser.add_argument("--unset", action="store_true", help="Remove the account's name")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.words:
+        parser.error("--unset does not take a TEXT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL|ALIAS is required with --unset")
+    if args.account is not None and not args.unset and not args.words:
+        parser.error("TEXT is required (or pass --unset to remove the name)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            rows = switcher.list_display_names()
+            if not rows:
+                print(dimmed("No names set"))
+                return
+            print(bolded("Names:"))
+            for num, name, email in rows:
+                print(f"  {num}: {name} {muted(f'({email})')}")
+            return
+
+        if args.unset:
+            account_num = switcher.unset_display_name(args.account)
+            print(f"{accent('Removed name')} for Account {account_num}")
+        else:
+            account_num, normalized = switcher.set_display_name(
+                args.account, " ".join(args.words)
+            )
+            print(f"{accent('Set name')} '{normalized}' for Account {account_num}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -1217,6 +1299,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "name":
+        _name_command(argv[1:])
+        return
     if argv and argv[0] == "threshold":
         _threshold_command(argv[1:])
         return
@@ -1270,6 +1355,9 @@ Commands:
   %(prog)s alias <num|email> <name>   set a short alias for an account
   %(prog)s alias <num|email> --unset  remove an account's alias
   %(prog)s alias                      list all aliases
+  %(prog)s name <num|email|alias> <text>  set a display name (spaces allowed)
+  %(prog)s name <num|email|alias> --unset  remove an account's name
+  %(prog)s name                       list all names
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits

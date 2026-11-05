@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -47,6 +48,63 @@ def normalize_alias(name: str) -> str:
             f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
         )
     return normalized
+
+
+#: Longest display name accepted, in characters (code points). Long enough for
+#: "Luxoft Global Operations – second seat", short enough that a TUI card
+#: header or a `cswap list` row still fits beside the org tag.
+DISPLAY_NAME_MAX_LEN = 40
+
+# Format characters (Unicode category Cf) are refused — the bidi overrides
+# among them can make a label read as something else — except the two
+# joiners that composite emoji are built from.
+_DISPLAY_NAME_JOINERS = frozenset({chr(0x200C), chr(0x200D)})  # ZWNJ, ZWJ
+
+
+def normalize_display_name(name: str) -> str:
+    """Trim and validate a free-form display name; raise ValueError if invalid.
+
+    Unlike an alias, a display name is never an identifier: it is not matched
+    by ``switch``/``remove``/``run``, so it may hold spaces, capitals and any
+    script, and two accounts may share one. It is refused when empty, longer
+    than ``DISPLAY_NAME_MAX_LEN``, or carrying a character that would break the
+    one-line header it is printed into (control characters, line separators,
+    bidi overrides).
+
+    Shared by ``cswap name``, the TUI form and import validation, so every
+    path enforces identical rules.
+    """
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("name cannot be empty")
+    if len(normalized) > DISPLAY_NAME_MAX_LEN:
+        raise ValueError(
+            f"name is {len(normalized)} characters long; "
+            f"the limit is {DISPLAY_NAME_MAX_LEN}"
+        )
+    for ch in normalized:
+        category = unicodedata.category(ch)
+        if category in ("Cc", "Cs", "Zl", "Zp") or (
+            category == "Cf" and ch not in _DISPLAY_NAME_JOINERS
+        ):
+            raise ValueError(
+                "name cannot contain control or formatting characters "
+                f"(found U+{ord(ch):04X})"
+            )
+    return normalized
+
+
+def account_label(email: str, alias: str = "", display_name: str = "") -> str:
+    """How an account is named on one line: ``Name · alias (email)``.
+
+    Each part is optional except the e-mail: ``Name (email)`` with only a
+    name, ``alias (email)`` with only an alias (the format before display
+    names existed), and the bare e-mail with neither. The single source of
+    the rule — styled surfaces (the TUI cards, ``cswap list``) colour the same
+    parts in the same order, and their tests compare against this plain form.
+    """
+    head = " · ".join(part for part in (display_name, alias) if part)
+    return f"{head} ({email})" if head else email
 
 
 #: Per-account switch-away threshold bounds, in binding-window utilization
@@ -247,6 +305,14 @@ class AccountSnapshot:
     #: None for a slot whose plan has never been fetched. Defaulted for the
     #: same reason as ``policy``.
     subscription_plan: dict | None = None
+    #: Free-form display name (``cswap name``), "" when unset. Defaulted and
+    #: appended last for the same reason as ``policy``.
+    display_name: str = ""
+
+    @property
+    def label(self) -> str:
+        """``Name · alias (email)`` — see :func:`account_label`."""
+        return account_label(self.email, self.alias, self.display_name)
 
     @property
     def display_tag(self) -> str:

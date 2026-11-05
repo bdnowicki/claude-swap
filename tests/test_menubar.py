@@ -318,6 +318,27 @@ def test_format_account_label_with_alias():
     assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_account_label_with_display_name():
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, alias="dev", display_name="Main"
+    )
+    assert label == "2  Main · dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, display_name="Main")
+    assert label == "2  Main  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_title_prefers_alias_then_cut_name_then_local_part():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    long_name = "Luxoft Global Operations"
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, alias="dev", display_name=long_name
+    ) == "⇄ dev"
+    assert menubar.format_title(
+        "loc@papaya.asia", _USAGE, s, display_name=long_name
+    ) == "⇄ Luxoft Glob*"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s, display_name="") == "⇄ loc"
+
+
 def test_format_account_label_disabled_marker():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
     assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
@@ -593,13 +614,16 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
+    def __init__(
+        self, number, email, is_active, usage, alias="", disabled=False, display_name=""
+    ):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
         self.alias = alias
         self.disabled = disabled
+        self.display_name = display_name
 
 
 class _FakeSnap:
@@ -621,18 +645,22 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0)),
+        _FakeAcct(
+            "1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0),
+            display_name="Main",
+        ),
         _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
     assert snap["active_alias"] == ""
-    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0)
+    assert snap["active_display_name"] == "Main"
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, display_name)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, "Main")
     # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None, "",
     )
 
 

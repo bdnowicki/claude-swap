@@ -68,6 +68,7 @@ from claude_swap.models import (
     normalize_account_priority,
     normalize_account_threshold,
     normalize_alias,
+    normalize_display_name,
 )
 from claude_swap.printer import (
     abbreviate_path,
@@ -301,6 +302,26 @@ def last_seen_note(entry: UsageEntry) -> str | None:
         f"last seen {100 - headroom:.0f}% used · "
         f"{format_age(int(entry.fetched_at * 1000))}"
     )
+
+
+def _styled_account_label(email: str, alias: str, display_name: str) -> str:
+    """:func:`~claude_swap.models.account_label`, coloured for ``cswap list``.
+
+    The same parts in the same order — ``Name · alias (email)`` — with the
+    name bold, the alias in the accent colour it has always had, and the
+    separator muted. With colours off it is byte-identical to the plain form.
+    """
+    head = [
+        part
+        for part in (
+            bolded(display_name) if display_name else "",
+            accent(alias) if alias else "",
+        )
+        if part
+    ]
+    if not head:
+        return email
+    return f"{muted(' · ').join(head)} ({email})"
 
 
 def _plan_marker(record: dict | None, now: float) -> str:
@@ -1151,6 +1172,75 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    def set_display_name(self, identifier: str, name: str) -> tuple[str, str]:
+        """Set (or replace) the free-form display name for an account.
+
+        The display-only sibling of :meth:`set_alias`: it is shown in front of
+        the alias (``Name · alias (email)``) but never resolves an account, so
+        it carries no uniqueness rule and no format beyond
+        :func:`~claude_swap.models.normalize_display_name`. ``identifier`` is
+        a slot number, email or alias. Returns ``(account_num, normalized)``.
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+            ValidationError: the name is empty, too long, or unprintable.
+        """
+        self._refuse_session_shell()
+        try:
+            normalized = normalize_display_name(name)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        account_num, data, record = self._account_record_for_edit(identifier)
+        record["displayName"] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        return account_num, normalized
+
+    def unset_display_name(self, identifier: str) -> str:
+        """Clear an account's display name. Idempotent, like :meth:`unset_alias`.
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+        """
+        self._refuse_session_shell()
+        account_num, data, record = self._account_record_for_edit(identifier)
+        if "displayName" in record:
+            del record["displayName"]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        return account_num
+
+    def list_display_names(self) -> list[tuple[str, str, str]]:
+        """Every set display name as ``(account_num, name, email)``, slot order."""
+        data = self._get_sequence_data_migrated()
+        accounts = (data or {}).get("accounts", {})
+        rows = [
+            (num, acc.get("displayName"), acc.get("email", ""))
+            for num, acc in accounts.items()
+            if isinstance(acc.get("displayName"), str) and acc.get("displayName")
+        ]
+        return sorted(rows, key=lambda r: int(r[0]))
+
+    def _account_record_for_edit(self, identifier: str) -> tuple[str, dict, dict]:
+        """``(account_num, sequence data, that account's record)`` for an edit.
+
+        The lookup a metadata setter needs: migrate, resolve the identifier
+        (number -> alias -> email), and insist the record exists. The record
+        returned is the live dict inside the returned data, so the caller
+        mutates it and writes ``data`` back.
+        """
+        self._get_sequence_data_migrated()
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
+            )
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        return account_num, data, record
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
@@ -1990,6 +2080,7 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
                     subscription_plan=plans.get(n),
+                    display_name=self._display_name_from_data(seq_data, n),
                 )
             )
         return AccountsSnapshot(
@@ -2091,6 +2182,17 @@ class ClaudeAccountSwitcher:
         """Whether a slot is flagged out of rotation in already-loaded data."""
         record = data.get("accounts", {}).get(str(account_num))
         return bool(record and record.get("disabled"))
+
+    @staticmethod
+    def _display_name_from_data(data: dict, account_num: str) -> str:
+        """A slot's display name from already-loaded data, "" when unset.
+
+        Anything but a string reads as unset: the field is display-only, so a
+        hand-edited ``sequence.json`` must cost the label, never the listing.
+        """
+        record = data.get("accounts", {}).get(str(account_num)) or {}
+        name = record.get("displayName")
+        return name if isinstance(name, str) else ""
 
     @staticmethod
     def _policy_from_data(data: dict, account_num: str) -> AccountPolicy:
@@ -4068,7 +4170,9 @@ class ClaudeAccountSwitcher:
 
         # Capture any alias to carry forward before destructive cleanup below
         # deletes the old record (same account moving slots, or refreshing in place).
+        # The display name rides along on exactly the same terms.
         existing_alias = None
+        existing_name = None
         if slot is not None:
             prior = data.get("accounts", {}).get(account_num) or {}
             if (
@@ -4076,8 +4180,12 @@ class ClaudeAccountSwitcher:
                 and prior.get("organizationUuid", "") == current_org_uuid
             ):
                 existing_alias = prior.get("alias")
+                existing_name = prior.get("displayName")
             if migrate_from:
                 existing_alias = data["accounts"][migrate_from].get("alias") or existing_alias
+                existing_name = (
+                    data["accounts"][migrate_from].get("displayName") or existing_name
+                )
 
         if alias is not None:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
@@ -4154,6 +4262,8 @@ class ClaudeAccountSwitcher:
         carried_alias = alias if alias is not None else existing_alias
         if carried_alias:
             data["accounts"][account_num]["alias"] = carried_alias
+        if isinstance(existing_name, str) and existing_name:
+            data["accounts"][account_num]["displayName"] = existing_name
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
@@ -6005,6 +6115,7 @@ class ClaudeAccountSwitcher:
                         entry.backoff_until if entry.in_backoff(now) else None
                     ),
                     alias=alias,
+                    display_name=self._display_name_from_data(seq_data, str(num)),
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
@@ -6068,7 +6179,9 @@ class ClaudeAccountSwitcher:
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
-            label = f"{accent(alias)} ({email})" if alias else email
+            label = _styled_account_label(
+                email, alias, self._display_name_from_data(seq_data, str(num))
+            )
             markers = ""
             if is_active:
                 markers += f" {bold_accent('(active)')}"

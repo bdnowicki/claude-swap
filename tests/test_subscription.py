@@ -757,8 +757,10 @@ class TestListMarker:
 
 class TestSnapshotField:
     def test_appended_after_policy(self):
+        # Defaulted fields go on the end so positional constructions keep
+        # working; `display_name` (cswap name) has since been appended after.
         names = [f.name for f in dataclasses.fields(AccountSnapshot)]
-        assert names[-1] == "subscription_plan"
+        assert names[-2:] == ["subscription_plan", "display_name"]
         assert names[names.index("subscription_plan") - 1] == "policy"
 
     def test_defaults_to_none(self):

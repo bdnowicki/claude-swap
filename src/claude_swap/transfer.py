@@ -23,7 +23,12 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
-from claude_swap.models import Platform, get_timestamp, normalize_alias
+from claude_swap.models import (
+    Platform,
+    get_timestamp,
+    normalize_alias,
+    normalize_display_name,
+)
 from claude_swap.oauth import credential_fingerprint
 
 if TYPE_CHECKING:
@@ -80,7 +85,9 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
     # Org/uuid/added must be strings (or absent). A list/dict here would
     # otherwise blow up downstream (unhashable in seen_keys, broken composite
     # key matching, garbage in sequence.json).
-    for field in ("organizationUuid", "organizationName", "uuid", "added", "alias"):
+    for field in (
+        "organizationUuid", "organizationName", "uuid", "added", "alias", "displayName",
+    ):
         if field in account and account[field] is not None:
             if not isinstance(account[field], str):
                 raise TransferError(
@@ -93,6 +100,16 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
             normalize_alias(alias)
         except ValueError as e:
             raise TransferError(f"invalid alias for {email}: {e}") from e
+
+    # Display-only, so no uniqueness pass like the alias gets below — but the
+    # same format rule as `cswap name`, so an import cannot plant a label the
+    # CLI would have refused (a newline, a bidi override, 400 characters).
+    display_name = account.get("displayName")
+    if isinstance(display_name, str) and display_name:
+        try:
+            normalize_display_name(display_name)
+        except ValueError as e:
+            raise TransferError(f"invalid displayName for {email}: {e}") from e
 
     return email, str(raw_number)
 
@@ -266,6 +283,8 @@ def export_accounts(
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
+        if isinstance(record.get("displayName"), str) and record["displayName"]:
+            entry["displayName"] = record["displayName"]
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -425,6 +444,11 @@ def import_accounts(
                 "added": raw.get("added") or get_timestamp(),
                 "kind": "api_key" if is_api_key else "oauth",
                 "alias": alias,
+                "display_name": (
+                    normalize_display_name(raw["displayName"])
+                    if raw.get("displayName")
+                    else None
+                ),
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
             }
@@ -558,6 +582,8 @@ def import_accounts(
             new_record["kind"] = "api_key"
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
+        if entry.get("display_name"):
+            new_record["displayName"] = entry["display_name"]
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

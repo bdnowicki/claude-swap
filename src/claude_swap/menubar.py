@@ -347,6 +347,13 @@ def usage_summary(
     return " · ".join(parts) if parts else "usage unavailable"
 
 
+def _menu_identity(email: str, alias: str | None, display_name: str | None) -> str:
+    """``Name · alias  (email)`` — ``models.account_label``'s parts and order,
+    with the two-space gap the menu has always put before the e-mail."""
+    head = " · ".join(part for part in (display_name, alias) if part)
+    return f"{head}  ({email})" if head else email
+
+
 def format_account_label(
     num,
     email: str,
@@ -355,15 +362,17 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    display_name: str | None = None,
 ) -> str:
     """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
+    label = _menu_identity(email, alias, display_name)
     marker = "  (disabled)" if disabled else ""
     return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
-    """Email text before '@', truncated with a trailing '*' marker."""
+    """Email text before '@', truncated with a trailing '*' marker (a display
+    name has no '@', so it is simply truncated the same way)."""
     local = email.split("@", 1)[0]
     if len(local) > limit:
         return local[: limit - 1] + "*"
@@ -376,15 +385,27 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    display_name: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    The account segment prefers the alias — it exists to be short — then the
+    display name cut like the e-mail's local part, then that local part: the
+    menu bar is the one surface with no room for ``Name · alias``.
+    """
     if active_email is None:
         return ICON
     if now is None:
         now = time.time()
     segments: list[str] = []
     if settings.show_account_name:
-        segments.append(alias if alias else _local_part(active_email))
+        segments.append(
+            alias
+            if alias
+            else _local_part(display_name)
+            if display_name
+            else _local_part(active_email)
+        )
     if isinstance(active_usage, dict) and isinstance(active_usage.get("rejected"), dict):
         segments.append("rejected (!)")
     if settings.title_pct in ("5h", "both"):
@@ -513,15 +534,16 @@ EMPTY_SNAPSHOT: dict = {
     "active_email": None,
     "active_usage": None,
     "active_alias": None,
+    "active_display_name": "",
 }
 
 
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, display_name), ...],
     "active_email": str | None, "active_usage": dict | str | None,
-    "active_alias": str | None}``. The snapshot itself is produced by
+    "active_alias": str | None, "active_display_name": str}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time, used only for the pace marker (issue #125).
@@ -530,21 +552,24 @@ def _adapt_snapshot(snap) -> dict:
     active_email = None
     active_usage = None
     active_alias = None
+    active_display_name = ""
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         accounts.append(
             (
                 acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
-                acc.alias, acc.disabled, acc.usage.fetched_at,
+                acc.alias, acc.disabled, acc.usage.fetched_at, acc.display_name,
             )
         )
         if acc.is_active:
             active_email, active_usage, active_alias = acc.email, display, acc.alias
+            active_display_name = acc.display_name
     return {
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
         "active_alias": active_alias,
+        "active_display_name": active_display_name,
     }
 
 
@@ -742,7 +767,7 @@ def run(switcher) -> int:
             ``_usage_log_key``) so an idle machine doesn't churn the rotating
             log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at, _name in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -856,6 +881,7 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                display_name=self.snapshot.get("active_display_name"),
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -878,10 +904,11 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good, alias, disabled, fetched_at, display_name in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled,
+                        fetched_at=fetched_at, display_name=display_name,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -920,8 +947,8 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at, display_name in accounts:
+                label = f"{num}  {_menu_identity(email, alias, display_name)}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
@@ -930,8 +957,8 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
-                name = f"{alias}  ({email})" if alias else email
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at, display_name in accounts:
+                name = _menu_identity(email, alias, display_name)
                 item = rumps.MenuItem(
                     f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
                 )

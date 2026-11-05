@@ -418,6 +418,7 @@ def account_row(
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
     subscription_plan: dict | None = None,
+    display_name: str = "",
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -434,6 +435,11 @@ def account_row(
     }
     if alias:
         row["alias"] = alias
+    # Same convention as `alias`: absent until one is set with `cswap name`.
+    # Display only — never an identifier — so scripts keying on accounts
+    # keep using `number`, `email` or `alias`.
+    if display_name:
+        row["displayName"] = display_name
     # Additive field: present only when the slot is held out of rotation, so
     # existing consumers keying on the base schema are unaffected.
     if disabled:
