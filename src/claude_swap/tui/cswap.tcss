@@ -123,7 +123,7 @@ MenuItem Static.menu-item-muted { color: $secondary; }
 
 /* -- modals ----------------------------------------------------------------- */
 
-ConfirmModal, AddTokenModal, OutputModal {
+ConfirmModal, AddTokenModal, IdentityModal, OutputModal {
     align: center middle;
     background: $background 60%;
 }
@@ -201,5 +201,17 @@ ConfirmModal, AddTokenModal, OutputModal {
 }
 
 AddTokenModal Input {
+    margin-bottom: 1;
+}
+
+/* Alias & name form: a label over each field and a one-line rule under it. */
+.field-label {
+    color: $foreground;
+    text-style: bold;
+}
+
+.field-hint {
+    height: 1;
+    color: $secondary;
     margin-bottom: 1;
 }
