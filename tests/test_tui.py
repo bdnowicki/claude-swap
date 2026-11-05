@@ -2673,27 +2673,96 @@ class TestWatchAccountEdits:
             await pilot.press("s")
             await pilot.pause()
 
-    async def test_d_and_a_are_inert_while_just_watching(self, tmp_path):
-        """Even with a cursor on a row: a single click puts one there in
-        monitor mode, and that must not arm `d` on the clicked account."""
+    @staticmethod
+    def _footer(app) -> dict[str, str]:
+        """Footer key -> label, as the Footer widget would draw it."""
+        return {
+            key: active.binding.description
+            for key, active in app.screen.active_bindings.items()
+            if active.binding.show
+        }
+
+    async def test_monitor_footer_offers_d_and_a(self, tmp_path):
+        """The reported gap: while just watching, nothing said `d`/`a` exist."""
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(80, 40)) as pilot:
+            await self._watch(pilot, select=False)
+            footer = self._footer(app)
+            assert footer["d"] == "Disable/enable"
+            assert footer["a"] == "Alias & name"
+            assert "enter" not in footer  # Enter stays inert until armed
+
+    async def test_first_d_while_watching_only_arms(self, tmp_path):
+        """Never acts on a row it was not aimed at: a single click puts a
+        cursor on a row in monitor mode, and the first `d` must not toggle
+        that row — it arms selection on the active account instead."""
         fake = self._fake(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(110, 40)) as pilot:
             await self._watch(pilot, select=False)
+            from textual.widgets import ListView, Static
+
+            listview = app.screen.query_one("#accounts", ListView)
+            listview.index = 1  # as a single click does
+            await pilot.pause()
+            await pilot.press("d")
+            await settle(pilot)
+            assert _edit_calls(fake) == []
+            assert listview.index == 0  # armed on the active account
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert title.startswith("disable / enable which account?")
+            assert self._footer(app)["enter"] == "Toggle"
+
+    async def test_armed_by_d_enter_and_d_toggle_never_switch(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=False)
+            await pilot.press("d", "down", "d")
+            await settle(pilot)
+            assert _edit_calls(fake) == [("set_disabled", "2", True)]
+            await pilot.press("enter")
+            await settle(pilot)
             from textual.widgets import ListView
 
-            from claude_swap.tui.dashboard import WatchScreen
+            assert _edit_calls(fake)[-1] == ("set_disabled", "2", False)
+            assert app.screen.query_one("#accounts", ListView).index == 1  # still armed
+            assert not any(c[0] == "switch_to" for c in fake.calls)
 
-            app.screen.query_one("#accounts", ListView).index = 1  # as a click does
+    async def test_armed_by_a_enter_opens_the_form(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=False)
+            await pilot.press("a")
             await pilot.pause()
-            await pilot.press("d", "a")
+            from claude_swap.tui.dashboard import WatchScreen
+            from claude_swap.tui.modals import IdentityModal
+
+            assert isinstance(app.screen, WatchScreen)  # armed, form not yet open
+            assert self._footer(app)["enter"] == "Edit"
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            assert isinstance(app.screen, IdentityModal)
+            assert app.screen._number == "2"
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+
+    async def test_s_re_aims_an_armed_selection_at_switching(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=False)
+            await pilot.press("d", "down", "s")
+            await pilot.pause()
+            from textual.widgets import ListView
+
+            assert app.screen.query_one("#accounts", ListView).index == 1  # kept
+            assert self._footer(app)["enter"] == "Switch"
+            await pilot.press("enter")
             await settle(pilot)
-            assert isinstance(app.screen, WatchScreen)  # no form opened
+            assert ("switch_to", "2") in fake.calls
+            assert app.screen.query_one("#accounts", ListView).index is None  # monitor
             assert _edit_calls(fake) == []
-            assert not app.screen.check_action("toggle_disabled_highlighted", ())
-            await pilot.press("s")
-            await pilot.pause()
-            assert app.screen.check_action("toggle_disabled_highlighted", ())
 
     async def test_d_toggles_the_highlighted_account_and_stays_selecting(self, tmp_path):
         fake = self._fake(tmp_path)
