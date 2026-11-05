@@ -26,7 +26,14 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
-from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
+from claude_swap.tui.modals import (
+    AddTokenModal,
+    ConfirmModal,
+    IdentityForm,
+    IdentityModal,
+    OutputModal,
+    TokenForm,
+)
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
 
@@ -348,6 +355,65 @@ class CswapApp(App):
             f"{verb} account {number}",
             partial(self.switcher.set_account_disabled, number, target),
         )
+
+    def edit_identity(self, number: str) -> None:
+        """Open the alias & name form for one account, prefilled.
+
+        Every other account's alias goes in as taken, so the form can refuse
+        a duplicate before it closes instead of failing the write after.
+        """
+        snap = self.snapshot
+        accounts = snap.accounts if snap else ()
+        acc = next((a for a in accounts if a.number == number), None)
+        if acc is None:
+            return
+        taken = {a.alias: a.number for a in accounts if a.alias and a.number != number}
+        self.push_screen(
+            IdentityModal(
+                number=number,
+                email=acc.email,
+                org_tag=acc.display_tag,
+                alias=acc.alias,
+                name=acc.display_name,
+                taken_aliases=taken,
+            ),
+            partial(self._on_identity_form, number, acc.alias, acc.display_name),
+        )
+
+    def _on_identity_form(
+        self, number: str, old_alias: str, old_name: str, form: IdentityForm | None
+    ) -> None:
+        if form is None:
+            return
+        if (form.alias, form.name) == (old_alias, old_name):
+            self.notify("Nothing changed", timeout=2)
+            return
+        self._start_action(
+            f"Alias & name for account {number}",
+            partial(self._apply_identity, number, old_alias, old_name, form),
+        )
+
+    def _apply_identity(
+        self, number: str, old_alias: str, old_name: str, form: IdentityForm
+    ) -> None:
+        """Write only what changed, then print the one line the notification
+        shows. Runs inside ``run_action`` (off-thread, output captured)."""
+        changes: list[str] = []
+        if form.alias != old_alias:
+            if form.alias:
+                self.switcher.set_alias(number, form.alias)
+                changes.append(f"alias '{form.alias}'")
+            else:
+                self.switcher.unset_alias(number)
+                changes.append("alias removed")
+        if form.name != old_name:
+            if form.name:
+                self.switcher.set_display_name(number, form.name)
+                changes.append(f"name '{form.name}'")
+            else:
+                self.switcher.unset_display_name(number)
+                changes.append("name removed")
+        print(f"Account {number}: {', '.join(changes)}")
 
     def do_reorder(
         self, first: str, second: str, *, then: Callable[[bool], None] | None = None

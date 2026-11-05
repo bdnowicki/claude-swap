@@ -1,7 +1,8 @@
-"""Modal screens: confirmations, token entry, and captured-output display."""
+"""Modal screens: confirmations, token entry, alias & name, captured output."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from rich.text import Text
@@ -10,6 +11,12 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
+
+from claude_swap.models import (
+    DISPLAY_NAME_MAX_LEN,
+    normalize_alias,
+    normalize_display_name,
+)
 
 
 class ConfirmModal(ModalScreen[bool]):
@@ -128,6 +135,130 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
                 self.query_one("#form-error", Static).update("Slot must be >= 1.")
                 return
         self.dismiss(TokenForm(token=token, email=email, slot=slot))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+@dataclass(frozen=True)
+class IdentityForm:
+    """What the alias-and-name modal collects, already normalized.
+
+    ``""`` means "none": the caller removes whatever the account had.
+    """
+
+    alias: str
+    name: str
+
+
+class IdentityModal(ModalScreen["IdentityForm | None"]):
+    """Edit one account's alias and display name in a single form.
+
+    Prefilled with the current values; an emptied field removes that value.
+    Every rule is checked here, before the form closes, so a typo costs a
+    correction rather than a failed action and a retype: the alias format and
+    uniqueness (``taken_aliases`` maps every *other* account's alias to its
+    number), and the display-name rules. The store re-checks both on write,
+    so a race with another process still fails safely, just later.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("left", "app.focus_previous", show=False),
+        Binding("right", "app.focus_next", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        number: str,
+        email: str,
+        org_tag: str,
+        alias: str,
+        name: str,
+        taken_aliases: Mapping[str, str],
+    ) -> None:
+        super().__init__()
+        self._number = number
+        self._email = email
+        self._org_tag = org_tag
+        self._alias = alias
+        self._name = name
+        self._taken = dict(taken_aliases)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box"):
+            yield Label(
+                f"Alias & name · account {self._number}", classes="modal-title"
+            )
+            yield Static(f"{self._email}\n[{self._org_tag}]", classes="modal-body")
+            yield Label("alias", classes="field-label")
+            yield Input(
+                value=self._alias,
+                placeholder="e.g. luxoft-main",
+                id="alias",
+            )
+            yield Static(
+                "lowercase · letters, digits, - _ . · usable in cswap switch",
+                classes="field-hint",
+            )
+            yield Label("name", classes="field-label")
+            yield Input(
+                value=self._name,
+                placeholder="e.g. Luxoft – main",
+                id="name",
+                max_length=DISPLAY_NAME_MAX_LEN,
+            )
+            yield Static(
+                f"anything · up to {DISPLAY_NAME_MAX_LEN} characters · display only",
+                classes="field-hint",
+            )
+            yield Static("", id="form-error", classes="form-error")
+            with Horizontal(classes="modal-buttons"):
+                yield Button("Save", id="save")
+                yield Button("Cancel", id="cancel")
+            yield Static(
+                "empty field = remove  ·  enter save  ·  tab next  ·  esc cancel",
+                classes="modal-hint",
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def _error(self, message: str, field: str) -> None:
+        self.query_one("#form-error", Static).update(message)
+        self.query_one(f"#{field}", Input).focus()
+
+    def _submit(self) -> None:
+        alias_raw = self.query_one("#alias", Input).value.strip()
+        name_raw = self.query_one("#name", Input).value.strip()
+        alias = ""
+        if alias_raw:
+            try:
+                alias = normalize_alias(alias_raw)
+            except ValueError as e:
+                self._error(f"Alias: {e}", "alias")
+                return
+            owner = self._taken.get(alias)
+            if owner is not None:
+                self._error(
+                    f"Alias: '{alias}' is already used by account {owner}", "alias"
+                )
+                return
+        name = ""
+        if name_raw:
+            try:
+                name = normalize_display_name(name_raw)
+            except ValueError as e:
+                self._error(f"Name: {e}", "name")
+                return
+        self.dismiss(IdentityForm(alias=alias, name=name))
 
     def action_cancel(self) -> None:
         self.dismiss(None)

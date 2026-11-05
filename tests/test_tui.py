@@ -119,6 +119,7 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    display_name: str = "",
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -131,6 +132,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        display_name=display_name,
     )
 
 
@@ -233,6 +235,32 @@ class FakeSwitcher:
         ]
         verb = "Disabled" if disabled else "Enabled"
         print(f"{verb} Account-{identifier}")
+
+    def _edit(self, identifier: str, **changes) -> None:
+        self._accounts = [
+            dataclasses.replace(a, **changes) if a.number == str(identifier) else a
+            for a in self._accounts
+        ]
+
+    def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
+        self.calls.append(("set_alias", str(identifier), alias))
+        self._edit(identifier, alias=alias)
+        return str(identifier), alias
+
+    def unset_alias(self, identifier: str) -> str:
+        self.calls.append(("unset_alias", str(identifier)))
+        self._edit(identifier, alias="")
+        return str(identifier)
+
+    def set_display_name(self, identifier: str, name: str) -> tuple[str, str]:
+        self.calls.append(("set_name", str(identifier), name))
+        self._edit(identifier, display_name=name)
+        return str(identifier), name
+
+    def unset_display_name(self, identifier: str) -> str:
+        self.calls.append(("unset_name", str(identifier)))
+        self._edit(identifier, display_name="")
+        return str(identifier)
 
     def add_account(self, slot: int | None = None, assume_yes: bool = False) -> None:
         self.calls.append(("add", slot, assume_yes))
@@ -1086,6 +1114,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "identity-menu",
                 "remove-menu",
                 "theme-menu",
                 "quit",
@@ -2590,3 +2619,270 @@ class TestWeeklyTick:
         assert with_weekly["Fable"] == with_weekly["7d"]
         without = ticks(threshold=85.0)
         assert without["5h"] == without["7d"] == without["Fable"] == with_weekly["5h"]
+
+
+# --- alias & name, and disable/enable on the account lists ---------------------
+
+
+def _edit_calls(fake) -> list[tuple]:
+    edits = {"set_disabled", "set_alias", "unset_alias", "set_name", "unset_name"}
+    return [c for c in fake.calls if c[0] in edits]
+
+
+class TestIdentityLabel:
+    """The card and mini headers render `Name · alias (email)` — exactly
+    `AccountSnapshot.label`, which every other surface is held to as well."""
+
+    @pytest.mark.parametrize(
+        ("alias", "name"), [("", ""), ("dev", ""), ("", "Main"), ("dev", "Main")]
+    )
+    def test_card_and_mini_headers(self, alias, name):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        acc = make_account(1, active=True, alias=alias, display_name=name)
+        card = account_card_text(acc, 100).plain.splitlines()[0]
+        mini = mini_account_text(acc, time.time()).plain
+        expected = f" 1  {acc.label}  [personal]"
+        assert card.startswith(expected)
+        assert mini.startswith(expected)
+        assert acc.label == (
+            {("", ""): "user1@example.com", ("dev", ""): "dev (user1@example.com)",
+             ("", "Main"): "Main (user1@example.com)",
+             ("dev", "Main"): "Main · dev (user1@example.com)"}[(alias, name)]
+        )
+
+
+@pytest.mark.asyncio
+class TestWatchAccountEdits:
+    """`d` / `a` on the watch screen live on the selection cursor `s` arms."""
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher(
+            [
+                make_account(1, active=True, alias="dev", display_name="Main"),
+                make_account(2, alias="spare"),
+            ],
+            tmp_path,
+        )
+
+    async def _watch(self, pilot, *, select: bool):
+        await settle(pilot)
+        await pilot.press("w")
+        await pilot.pause()
+        if select:
+            await pilot.press("s")
+            await pilot.pause()
+
+    async def test_d_and_a_are_inert_while_just_watching(self, tmp_path):
+        """Even with a cursor on a row: a single click puts one there in
+        monitor mode, and that must not arm `d` on the clicked account."""
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=False)
+            from textual.widgets import ListView
+
+            from claude_swap.tui.dashboard import WatchScreen
+
+            app.screen.query_one("#accounts", ListView).index = 1  # as a click does
+            await pilot.pause()
+            await pilot.press("d", "a")
+            await settle(pilot)
+            assert isinstance(app.screen, WatchScreen)  # no form opened
+            assert _edit_calls(fake) == []
+            assert not app.screen.check_action("toggle_disabled_highlighted", ())
+            await pilot.press("s")
+            await pilot.pause()
+            assert app.screen.check_action("toggle_disabled_highlighted", ())
+
+    async def test_d_toggles_the_highlighted_account_and_stays_selecting(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=True)
+            await pilot.press("down", "d")
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            assert _edit_calls(fake) == [("set_disabled", "2", True)]
+            assert app.screen.query_one("#accounts", ListView).index == 1
+            title = app.screen.query_one("#list-title", Static).render().plain
+            assert "d disable/enable" in title
+            await pilot.press("d")  # same key brings it back
+            await settle(pilot)
+            assert _edit_calls(fake)[-1] == ("set_disabled", "2", False)
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+
+    async def test_a_opens_the_prefilled_form_and_saves_what_changed(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=True)
+            await pilot.press("a")
+            await pilot.pause()
+            from textual.widgets import Input, ListView
+
+            from claude_swap.tui.dashboard import WatchScreen
+            from claude_swap.tui.modals import IdentityModal
+
+            modal = app.screen
+            assert isinstance(modal, IdentityModal)
+            assert modal.query_one("#alias", Input).value == "dev"
+            assert modal.query_one("#name", Input).value == "Main"
+            modal.query_one("#name", Input).value = "Luxoft main"
+            modal.query_one("#name", Input).focus()
+            await pilot.press("enter")
+            await settle(pilot)
+
+            assert _edit_calls(fake) == [("set_name", "1", "Luxoft main")]  # alias untouched
+            assert isinstance(app.screen, WatchScreen)
+            assert app.screen.query_one("#accounts", ListView).index == 0  # still selecting
+            assert app.snapshot.accounts[0].label == "Luxoft main · dev (user1@example.com)"
+
+    async def test_emptied_fields_remove_both(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=True)
+            await pilot.press("a")
+            await pilot.pause()
+            from textual.widgets import Input
+
+            modal = app.screen
+            modal.query_one("#alias", Input).value = ""
+            modal.query_one("#name", Input).value = "   "
+            modal.query_one("#name", Input).focus()
+            await pilot.press("enter")
+            await settle(pilot)
+            assert _edit_calls(fake) == [("unset_alias", "1"), ("unset_name", "1")]
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("alias", "spare", "already used by account 2"),
+            ("alias", "123", "purely numeric"),
+            ("alias", "has space", "may only contain"),
+            ("name", "a" + chr(9) + "b", "control or formatting"),  # a tab
+        ],
+        ids=["alias-taken", "alias-numeric", "alias-format", "name-control-char"],
+    )
+    async def test_invalid_input_stays_in_the_form(self, tmp_path, field, value, message):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=True)
+            await pilot.press("a")
+            await pilot.pause()
+            from textual.widgets import Input, Static
+
+            from claude_swap.tui.modals import IdentityModal
+
+            modal = app.screen
+            modal.query_one(f"#{field}", Input).value = value
+            modal.query_one(f"#{field}", Input).focus()
+            await pilot.press("enter")
+            await settle(pilot)
+            assert isinstance(app.screen, IdentityModal)
+            assert message in modal.query_one("#form-error", Static).render().plain
+            assert _edit_calls(fake) == []
+
+    async def test_saving_unchanged_values_writes_nothing(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=True)
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.press("enter")
+            await settle(pilot)
+            assert _edit_calls(fake) == []
+
+    async def test_escape_cancels_the_form(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await self._watch(pilot, select=True)
+            await pilot.press("a")
+            await pilot.pause()
+            from textual.widgets import Input
+
+            from claude_swap.tui.dashboard import WatchScreen
+
+            app.screen.query_one("#name", Input).value = "never saved"
+            await pilot.press("escape")
+            await settle(pilot)
+            assert isinstance(app.screen, WatchScreen)
+            assert _edit_calls(fake) == []
+
+
+@pytest.mark.asyncio
+class TestSwitchScreenAccountEdits:
+    """The switch screen's cursor is always live, so `d`/`a` are too — except
+    in reorder mode, where -/+ are the only keys that act on the cursor."""
+
+    def _fake(self, tmp_path):
+        return FakeSwitcher([make_account(1, active=True), make_account(2)], tmp_path)
+
+    async def test_d_and_a_act_on_the_highlighted_row(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("down", "d")
+            await settle(pilot)
+            assert _edit_calls(fake) == [("set_disabled", "2", True)]
+            await pilot.press("a")
+            await pilot.pause()
+            from claude_swap.tui.dashboard import SwitchScreen
+            from claude_swap.tui.modals import IdentityModal
+
+            assert isinstance(app.screen, IdentityModal)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, SwitchScreen)
+            assert not any(c[0] == "switch_to" for c in fake.calls)
+
+    async def test_reorder_mode_keeps_them_inert(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.press("d", "a")
+            await settle(pilot)
+            from claude_swap.tui.dashboard import SwitchScreen
+
+            assert isinstance(app.screen, SwitchScreen)
+            assert _edit_calls(fake) == []
+
+
+@pytest.mark.asyncio
+class TestDashboardIdentityMenu:
+    async def test_menu_lists_accounts_and_opens_the_form(self, tmp_path):
+        fake = FakeSwitcher(
+            [make_account(1, active=True, display_name="Main"), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(110, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "identity-menu")
+            from textual.widgets import Input, ListView
+
+            from claude_swap.tui.modals import IdentityModal
+            from claude_swap.tui.widgets import MenuItem
+
+            menu = app.screen.query_one("#menu", ListView)
+            items = list(menu.query(MenuItem))
+            assert [i.action_id for i in items] == ["identity:1", "identity:2", "back"]
+            await menu_select(pilot, "identity:2")
+            assert isinstance(app.screen, IdentityModal)
+            app.screen.query_one("#alias", Input).value = "spare"
+            app.screen.query_one("#alias", Input).focus()
+            await pilot.press("enter")
+            await settle(pilot)
+            assert _edit_calls(fake) == [("set_alias", "2", "spare")]

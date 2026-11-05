@@ -10,7 +10,14 @@ account-targeted opens a context of its own:
   the same full cards but read-only: a live monitor. ``s`` arms selection
   (cursor appears on the active account), Enter switches and *stays
   watching*, Esc disarms.
-- "Remove account" nests into a submenu listing the accounts.
+- "Remove account", "Disable / enable account" and "Alias & name" nest into
+  a submenu listing the accounts.
+
+On the account lists, wherever a cursor is live — always on the switch
+screen, once ``s`` has armed it on the watch screen — ``d`` disables or
+re-enables the highlighted account and ``a`` opens its alias & name form.
+Neither switches anything, and both stay put afterwards so several accounts
+can be edited in a row.
 
 ``o`` arms reorder mode on either list: ``-``/``+`` then move the selected
 account one place up or down (the accounts trade slot numbers, so their
@@ -40,6 +47,10 @@ if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
 
 FLASH_S = 1.5  # how long a just-refreshed row stays highlighted
+
+# The two per-account edits the lists offer on their cursor (`d`, `a`). Gated
+# together: wherever one is live, so is the other.
+_ACCOUNT_EDITS = frozenset({"toggle_disabled_highlighted", "edit_identity_highlighted"})
 
 MenuEntries = list[tuple[str, str]]  # (label, action_id)
 
@@ -87,6 +98,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            ("Alias & name…", "identity-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -102,11 +114,7 @@ class DashboardScreen(Screen):
     def _remove_entries(self) -> MenuEntries:
         snap = self.app.snapshot
         entries: MenuEntries = [
-            (
-                f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
-                f"  [{acc.display_tag}]",
-                f"remove:{acc.number}",
-            )
+            (f"{acc.number}  {acc.label}  [{acc.display_tag}]", f"remove:{acc.number}")
             for acc in (snap.accounts if snap else ())
         ]
         entries.append(_BACK)
@@ -118,12 +126,21 @@ class DashboardScreen(Screen):
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
-            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
             action = "→ enable" if acc.disabled else "→ disable"
             state = "  (disabled)" if acc.disabled else ""
             entries.append(
-                (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
+                (f"{acc.number}  {acc.label}{state}   {action}", f"disable:{acc.number}")
             )
+        entries.append(_BACK)
+        return entries
+
+    def _identity_entries(self) -> MenuEntries:
+        """One row per account; selecting it opens that account's form."""
+        snap = self.app.snapshot
+        entries: MenuEntries = [
+            (f"{acc.number}  {acc.label}  [{acc.display_tag}]", f"identity:{acc.number}")
+            for acc in (snap.accounts if snap else ())
+        ]
         entries.append(_BACK)
         return entries
 
@@ -199,6 +216,12 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "identity-menu":
+            await self._push_menu("alias & name", self._identity_entries())
+        elif action_id.startswith("identity:"):
+            number = action_id.split(":", 1)[1]
+            app.edit_identity(number)
             await self._pop_menu()
         else:
             actions[action_id]()
@@ -338,7 +361,31 @@ class AccountListScreen(Screen):
             return self._ordering  # hidden and inert until `o` arms it
         if action == "select_highlighted" and self._ordering:
             return False  # reorder mode: Enter must not switch accounts
+        if action in _ACCOUNT_EDITS and self._ordering:
+            return False  # reorder mode: -/+ only, one meaning for the cursor
         return True
+
+    # -- per-account edits (`d`, `a`) -----------------------------------------
+
+    def _highlighted_number(self) -> str | None:
+        """The account under the cursor, or None when there is no cursor."""
+        item = self.query_one("#accounts", ListView).highlighted_child
+        return item.number if isinstance(item, AccountItem) else None
+
+    def action_toggle_disabled_highlighted(self) -> None:
+        """Hold the highlighted account out of auto-rotation, or return it.
+
+        No confirmation: it is undone by the same key, and it never switches
+        the active login — the notification says which way it went.
+        """
+        number = self._highlighted_number()
+        if number is not None:
+            self.app.do_toggle_disabled(number)
+
+    def action_edit_identity_highlighted(self) -> None:
+        number = self._highlighted_number()
+        if number is not None:
+            self.app.edit_identity(number)
 
     def action_move(self, delta: int) -> None:
         """Move the selected account ``delta`` places down the list (-1 = up).
@@ -406,6 +453,8 @@ class SwitchScreen(AccountListScreen):
         # to the list cursor, so behavior is identical.
         Binding("enter", "select_highlighted", "Switch", priority=True),
         Binding("b", "app.switch_best", "Best pick"),
+        Binding("d", "toggle_disabled_highlighted", "Disable/enable"),
+        Binding("a", "edit_identity_highlighted", "Alias & name"),
         Binding("o", "toggle_order", "Reorder"),
         Binding("minus", "move(-1)", "Move up"),
         Binding("plus", "move(1)", "Move down"),
@@ -468,15 +517,25 @@ class WatchScreen(AccountListScreen):
     A double click switches without arming anything, in any mode: it is a
     deliberate gesture in a way Enter is not, which is the whole reason Enter
     is gated. Either way the screen returns to hands-off monitoring after.
+
+    Armed selection also offers ``d`` (disable / enable the highlighted
+    account) and ``a`` (its alias & name). Unlike Enter they leave selection
+    armed — editing one account is often the first of several — and Esc
+    still returns to monitoring.
     """
 
     _WATCH_TITLE = "watching all accounts"
-    _SELECT_TITLE = "switch to which account? · enter confirm · esc cancel"
+    _SELECT_TITLE = (
+        "switch to which account? · enter switch · d disable/enable"
+        " · a alias & name · esc cancel"
+    )
 
     BINDINGS = [
         Binding("s", "toggle_select", "Select"),
         Binding("o", "toggle_order", "Reorder"),
         Binding("enter", "select_highlighted", "Switch", priority=True),
+        Binding("d", "toggle_disabled_highlighted", "Disable/enable"),
+        Binding("a", "edit_identity_highlighted", "Alias & name"),
         Binding("minus", "move(-1)", "Move up"),
         Binding("plus", "move(1)", "Move down"),
         Binding("f", "app.refresh_full", "Refresh", show=False),
@@ -512,6 +571,8 @@ class WatchScreen(AccountListScreen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "select_highlighted" and not self._selecting:
             return False  # Enter is inert until selection is armed
+        if action in _ACCOUNT_EDITS and not self._selecting:
+            return False  # so are d/a: monitor mode has no account to act on
         return super().check_action(action, parameters)
 
     def _index_after_build(

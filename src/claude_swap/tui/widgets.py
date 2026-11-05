@@ -268,6 +268,31 @@ def usage_rows(
     return rows
 
 
+def _append_identity(text: Text, acc: AccountSnapshot, palette) -> None:
+    """``Name · alias (email)`` — ``AccountSnapshot.label``, styled.
+
+    The name in bold, the alias in the bold accent it has always had, the
+    separator muted. The plain text is exactly ``acc.label``, which is what
+    the tests hold every surface to.
+    """
+    head = [
+        (part, style)
+        for part, style in (
+            (acc.display_name, f"bold {palette.foreground}"),
+            (acc.alias, f"bold {palette.accent}"),
+        )
+        if part
+    ]
+    if not head:
+        text.append(acc.email, style=palette.foreground)
+        return
+    for i, (part, style) in enumerate(head):
+        if i:
+            text.append(" · ", style=palette.muted)
+        text.append(part, style=style)
+    text.append(f" ({acc.email})", style=palette.foreground)
+
+
 def _append_plan(text: Text, acc: AccountSnapshot, gap: str, palette) -> None:
     """``· Max 20x`` after the header — the same marker ``cswap list`` prints:
     a lapsed subscription is a highlighted ``Free`` rather than an appended
@@ -322,11 +347,7 @@ def account_card_text(
 
     text = Text()
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
-    if acc.alias:
-        text.append(acc.alias, style=f"bold {palette.accent}")
-        text.append(f" ({acc.email})", style=palette.foreground)
-    else:
-        text.append(acc.email, style=palette.foreground)
+    _append_identity(text, acc, palette)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
@@ -424,11 +445,7 @@ def mini_account_text(
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
-    if acc.alias:
-        text.append(acc.alias, style=f"bold {palette.accent}")
-        text.append(f" ({acc.email})", style=palette.foreground)
-    else:
-        text.append(acc.email, style=palette.foreground)
+    _append_identity(text, acc, palette)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
